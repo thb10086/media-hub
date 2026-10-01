@@ -1,0 +1,275 @@
+# media-hub stack. deploy/deploy.sh drives it; by hand, from the repository root:
+#   docker compose -p hub -f deploy/compose.yml up -d --build
+#
+# Interpolation (${...} below) and env_file both read deploy/.env, because this
+# file's directory is the compose project directory. deploy/env.example documents
+# every variable; deploy.sh writes deploy/.env with fresh secrets on first run.
+#
+# Networks:
+#   hub-data  internal only: postgres, redis and the processes that use them
+#   hub-edge  has internet access: SAU drives browsers, the worker fetches
+#             video_url and delivers webhooks, caddy terminates TLS
+#   shared    external network (HUB_SHARED_NETWORK) joined with the DTK stack:
+#             the gateway reaches DTK as dtk-api
+#
+# Sharing a host with other products: every container carries a memory and CPU
+# ceiling, and a raised oom_score_adj so that if the host runs out of memory the
+# kernel reclaims this stack before anything else running there.
+name: mediahub
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+x-hub-app: &hub-app
+  image: ${HUB_IMAGE:-media-hub}:${HUB_IMAGE_TAG:-dev}
+  build:
+    context: ..
+    dockerfile: Dockerfile
+    args:
+      PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+  env_file:
+    - path: .env
+      required: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  pids_limit: 256
+  oom_score_adj: 500
+  logging: *logging
+
+x-hub-environment: &hub-environment
+  HUB_DATABASE_URL: postgresql+asyncpg://hub:${HUB_POSTGRES_PASSWORD:?set HUB_POSTGRES_PASSWORD in deploy/.env}@hub-postgres:5432/hub
+  HUB_REDIS_URL: redis://:${HUB_REDIS_PASSWORD:?set HUB_REDIS_PASSWORD in deploy/.env}@hub-redis:6379/0
+  # The one-shot migrate service owns the schema; concurrent CREATE TABLE races.
+  HUB_AUTO_CREATE_SCHEMA: "false"
+  HUB_MEDIA_DIR: /data/media
+  HUB_SAU_BASE_URL: http://sau:5409
+  HUB_SAU_VIDEO_DIR: /data/sau-videos
+
+services:
+  hub-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: hub
+      POSTGRES_USER: hub
+      POSTGRES_PASSWORD: ${HUB_POSTGRES_PASSWORD:?set HUB_POSTGRES_PASSWORD in deploy/.env}
+    # Sized for a small host shared with DTK and other products; raise with the host.
+    command:
+      - postgres
+      - -c
+      - shared_buffers=32MB
+      - -c
+      - effective_cache_size=128MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - max_connections=40
+    volumes:
+      - hub-postgres-data:/var/lib/postgresql/data
+    networks:
+      - hub-data
+    mem_limit: 256m
+    cpus: 0.5
+    oom_score_adj: 500
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hub -d hub"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 1m
+    logging: *logging
+
+  hub-redis:
+    image: redis:8-alpine
+    user: redis
+    env_file:
+      - path: .env
+        required: true
+    # Rate-limit counters only, all with a TTL: nothing worth persisting.
+    # $$ leaves the password to the container's shell instead of the resolved config.
+    command:
+      - sh
+      - -c
+      - exec redis-server --requirepass "$$HUB_REDIS_PASSWORD" --maxmemory 32mb --maxmemory-policy volatile-lru --save "" --appendonly no
+    networks:
+      - hub-data
+    mem_limit: 64m
+    cpus: 0.25
+    oom_score_adj: 500
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$HUB_REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+    logging: *logging
+
+  migrate:
+    <<: *hub-app
+    command: ["media-hub", "init-db"]
+    environment: *hub-environment
+    networks:
+      - hub-data
+    depends_on:
+      hub-postgres:
+        condition: service_healthy
+    restart: "no"
+
+  gateway:
+    <<: *hub-app
+    environment:
+      <<: *hub-environment
+      WEB_CONCURRENCY: ${HUB_WEB_CONCURRENCY:-2}
+    volumes:
+      - hub-media:/data/media
+    ports:
+      - "${HUB_BIND_HOST:-0.0.0.0}:${HUB_BIND_PORT:-8080}:8080"
+    networks:
+      hub-data: {}
+      hub-edge: {}
+      shared:
+        # Stable name for a reverse proxy on the same host that joins this network.
+        aliases:
+          - media-hub-gateway
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      hub-redis:
+        condition: service_healthy
+    mem_limit: 384m
+    cpus: 1.0
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          with urllib.request.urlopen("http://127.0.0.1:8080/readyz", timeout=3) as r:
+              sys.exit(0 if r.status == 200 else 1)
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+  worker:
+    <<: *hub-app
+    command: ["python", "-m", "hub.worker"]
+    environment: *hub-environment
+    volumes:
+      - hub-media:/data/media
+      - sau-videos:/data/sau-videos
+    networks:
+      - hub-data
+      - hub-edge
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      sau:
+        condition: service_started
+    mem_limit: 256m
+    cpus: 0.5
+    restart: unless-stopped
+    # Room for an in-flight publish to finish; anything cut off is failed as
+    # stale by the next worker start (HUB_WORKER_STALE_AFTER_SECONDS).
+    stop_grace_period: 2m
+
+  sau:
+    image: ${SAU_IMAGE:-media-hub-sau}:${SAU_COMMIT:-dev}
+    build:
+      context: ./sau
+      additional_contexts:
+        sau_src: ../.build/sau
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+    # Chromium spawns many processes and leaves zombies; PID 1 must reap them.
+    init: true
+    shm_size: 512m
+    environment:
+      # Scheduled publish times are computed in local time and typed into the
+      # platform's form as Beijing time. A POSIX TZ string needs no tzdata.
+      TZ: ${HUB_PUBLISH_TZ:-CST-8}
+    volumes:
+      - sau-db:/app/db
+      - sau-cookies:/app/cookiesFile
+      - sau-videos:/app/videoFile
+    # No published port: SAU has no authentication and is reached only by the
+    # gateway (accounts, login) and the worker (publishing) over hub-edge.
+    networks:
+      - hub-edge
+    # One headless browser per publish or login; the worker publishes one at a time.
+    mem_limit: ${HUB_SAU_MEM_LIMIT:-1280m}
+    cpus: ${HUB_SAU_CPUS:-1.0}
+    pids_limit: 512
+    oom_score_adj: 600
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          with urllib.request.urlopen("http://127.0.0.1:5409/getAccounts", timeout=5) as r:
+              sys.exit(0 if r.status == 200 else 1)
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    restart: unless-stopped
+    stop_grace_period: 1m
+    logging: *logging
+
+  caddy:
+    image: caddy:2-alpine
+    profiles:
+      - tls
+    environment:
+      HUB_DOMAIN: ${HUB_DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      hub-edge:
+        # Fixed so HUB_TRUSTED_PROXIES can name exactly this address.
+        ipv4_address: ${HUB_PROXY_IP:-172.30.10.10}
+    depends_on:
+      - gateway
+    mem_limit: 128m
+    restart: unless-stopped
+    logging: *logging
+
+networks:
+  hub-data:
+    internal: true
+  hub-edge:
+    ipam:
+      config:
+        - subnet: ${HUB_EDGE_SUBNET:-172.30.10.0/24}
+  shared:
+    external: true
+    name: ${HUB_SHARED_NETWORK:-mediahub-shared}
+
+volumes:
+  hub-postgres-data:
+  hub-media:
+  sau-db:
+  sau-cookies:
+  sau-videos:
+  caddy-data:
+  caddy-config:

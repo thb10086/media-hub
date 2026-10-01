@@ -1,0 +1,1145 @@
+diff --git a/src/dtk/api/routes/content.py b/src/dtk/api/routes/content.py
+index 8ee5d13..411148d 100644
+--- a/src/dtk/api/routes/content.py
++++ b/src/dtk/api/routes/content.py
+@@ -172,6 +172,19 @@ COMMENT_ID_QUERY = Query(
+     max_length=64,
+     description="The parent comment whose replies you want; ids come from the comments endpoint.",
+ )
++KEYWORD_QUERY = Query(
++    min_length=1,
++    max_length=100,
++    description="The words to search for, as a user would type them into the search box.",
++)
++SORT_TYPE_QUERY = Query(
++    default=0,
++    description="How the platform orders results: 0 by relevance, 1 by most liked, 2 newest first.",
++)
++PUBLISH_TIME_QUERY = Query(
++    default=0,
++    description="Only posts published within this many days: 0 (any time), 1, 7 or 180.",
++)
+ 
+ 
+ def read_scope(platform: Platform) -> Scope:
+@@ -1418,6 +1431,140 @@ async def user_following(
+     )
+ 
+ 
++@router.get(
++    "/{platform}/search",
++    summary="Search posts by keyword",
++    openapi_extra={I18N_KEY: "search", **ASYNC_RESPONSES},
++)
++async def search(
++    request: Request,
++    platform: Platform = PLATFORM_PATH,
++    keyword: str = KEYWORD_QUERY,
++    sort_type: int = SORT_TYPE_QUERY,
++    publish_time: int = PUBLISH_TIME_QUERY,
++    cursor: str | None = CURSOR_QUERY,
++    count: int | None = COUNT_QUERY,
++    include_raw: bool = RAW_QUERY,
++    wait: float | None = WAIT_QUERY,
++    proxy: str | None = PROXY_QUERY,
++    identity: str | None = IDENTITY_QUERY,
++    refresh: bool = REFRESH_QUERY,
++    explain: bool = EXPLAIN_QUERY,
++    principal: Principal = Depends(enforce_rate_limit),
++) -> Any:
++    """One page of posts matching a keyword.
++
++    **Douyin only.** The platform's own sort orders are available - by
++    relevance, by most liked, or newest first - together with a publish-time
++    window; results come back in the platform's order. Result pages mix posts
++    with user, live-room and topic cards, and only the posts are returned, so a
++    page can hold fewer items than `count`.
++
++    Search is the surface the platform rate-limits first. Its quota is tighter
++    than any other endpoint's, and a guest identity may be asked to pass a
++    captcha sooner than an imported, signed-in one - which answers
++    `UPSTREAM_RISK_CONTROL` and cools the identity down.
++
++    **Parameters**
++
++    - `platform` - must be `douyin`.
++    - `keyword` - the words to search for.
++    - `sort_type` - 0 by relevance, 1 by most liked, 2 newest first.
++    - `publish_time` - only posts from the last 1, 7 or 180 days; 0 for any time.
++    - `cursor` - the cursor returned by the previous page. Omit it for the
++      first page; a response with no cursor is the last page. It carries the
++      query's search session, so reuse it only with the same keyword and filters.
++    - `count` - results requested per page.
++    - `include_raw` - include each post's untouched platform payload.
++    - `wait` - seconds to wait for the result. Omit it to get `202` and a task
++      id to poll.
++    - `identity` - send the request as this identity and no other. Requires
++      `identity:manage`.
++    - `refresh` - ignore any cached or in-flight answer and ask upstream again.
++      Without it a repeat inside `cache.list_ttl` (5 minutes by default) is
++      answered from the cache and costs nothing.
++
++    **Returns**
++
++    The same post shape as `/video`, one entry per post found, plus the cursor
++    for the next page.
++    """
++    authorize(principal, platform)
++    endpoint = supported(platform, Operation.SEARCH)
++    params: dict[str, Any] = {
++        "keyword": keyword.strip(),
++        "sort_type": sort_type,
++        "publish_time": publish_time,
++        "cursor": cursor,
++        "count": resolve_count(count, maximum=max_page_size(platform)),
++        "include_raw": include_raw,
++    }
++    return await operations.submit_and_wait(
++        request,
++        principal,
++        endpoint=endpoint,
++        params=params,
++        wait=resolve_wait(request, wait),
++        proxy=resolve_request_proxy(request, proxy),
++        refresh=refresh,
++        explain=await resolve_explain(request, principal, explain),
++        identity=await resolve_request_identity(request, principal, identity, platform=platform),
++    )
++
++
++@router.get(
++    "/{platform}/hot",
++    summary="The hot search board",
++    openapi_extra={I18N_KEY: "hot_search", **ASYNC_RESPONSES},
++)
++async def hot_search(
++    request: Request,
++    platform: Platform = PLATFORM_PATH,
++    include_raw: bool = RAW_QUERY,
++    wait: float | None = WAIT_QUERY,
++    proxy: str | None = PROXY_QUERY,
++    identity: str | None = IDENTITY_QUERY,
++    refresh: bool = REFRESH_QUERY,
++    explain: bool = EXPLAIN_QUERY,
++    principal: Principal = Depends(enforce_rate_limit),
++) -> Any:
++    """The platform's hot search board, as its web client shows it.
++
++    **Douyin only.** Each entry carries the phrase, its rank, the platform's
++    heat figure and, where the platform states them, a cover and the number of
++    related posts; the rising-topics list shown beside the board comes back as
++    `trending`. The board refreshes every few minutes upstream, and a repeat
++    inside `cache.list_ttl` is answered from the cache.
++
++    **Parameters**
++
++    - `platform` - must be `douyin`.
++    - `include_raw` - include each entry's untouched platform payload.
++    - `wait` - seconds to wait for the result. Omit it to get `202` and a task
++      id to poll.
++    - `identity` - send the request as this identity and no other. Requires
++      `identity:manage`.
++    - `refresh` - ignore any cached or in-flight answer and ask upstream again.
++
++    **Returns**
++
++    The board's entries in rank order, the trending list, and the time the
++    platform last refreshed the board.
++    """
++    authorize(principal, platform)
++    return await operations.submit_and_wait(
++        request,
++        principal,
++        endpoint=supported(platform, Operation.HOT_SEARCH),
++        params={"include_raw": include_raw},
++        wait=resolve_wait(request, wait),
++        proxy=resolve_request_proxy(request, proxy),
++        refresh=refresh,
++        explain=await resolve_explain(request, principal, explain),
++        identity=await resolve_request_identity(request, principal, identity, platform=platform),
++    )
++
++
+ # --------------------------------------------------------------------------
+ # Parameter assembly
+ # --------------------------------------------------------------------------
+diff --git a/src/dtk/api/routes/operations.py b/src/dtk/api/routes/operations.py
+index 55cd420..787118b 100644
+--- a/src/dtk/api/routes/operations.py
++++ b/src/dtk/api/routes/operations.py
+@@ -78,6 +78,8 @@ class Operation(StrEnum):
+     MIX_POSTS = "mix_posts"
+     AUTHOR_FOLLOWERS = "author_followers"
+     AUTHOR_FOLLOWING = "author_following"
++    SEARCH = "search"
++    HOT_SEARCH = "hot_search"
+ 
+ 
+ class Maintenance(StrEnum):
+diff --git a/src/dtk/i18n/locales/en.json b/src/dtk/i18n/locales/en.json
+index f088a9f..4dc1ea1 100644
+--- a/src/dtk/i18n/locales/en.json
++++ b/src/dtk/i18n/locales/en.json
+@@ -414,6 +414,10 @@
+         "summary": "Instance health",
+         "description": "Reports database, cache, browser RPC and identity pool health. Safe to poll from an uptime monitor."
+       },
++      "hot_search": {
++        "summary": "The hot search board",
++        "description": "The platform's hot search board in rank order - each phrase with its heat figure and, where the platform states them, a cover and the number of related posts - plus the rising-topics list shown beside it. Douyin only; a repeat inside cache.list_ttl is answered from the cache."
++      },
+       "identities_cookies": {
+         "summary": "What one identity's jar holds",
+         "description": "Cookie names, roles and masked values for one identity. Never the values themselves."
+@@ -510,6 +514,10 @@
+         "summary": "Read the request log",
+         "description": "Recent requests, newest first, filtered."
+       },
++      "search": {
++        "summary": "Search posts by keyword",
++        "description": "One page of posts matching a keyword, in the platform's own order: by relevance, by most liked, or newest first, optionally limited to the last 1, 7 or 180 days. Result pages mix posts with user and live-room cards and only the posts are returned, so a page can hold fewer items than count. Douyin only. Search is the surface the platform rate-limits first, so its quota is the tightest, and a guest identity may meet a captcha sooner than an imported signed-in one."
++      },
+       "settings_list": {
+         "summary": "Read every runtime setting",
+         "description": "Every runtime setting, with its current value and where that came from."
+@@ -626,6 +634,7 @@
+       "include_raw": "Also return the platform's own untouched payload alongside the normalized record.",
+       "key": "The setting to act on, as shown by the list endpoint.",
+       "key_id": "The key to revoke.",
++      "keyword": "The words to search for, as a user would type them into the search box.",
+       "kind": "Only entries of this kind.",
+       "lang": "Response language for human-readable text. One of en or zh; anything else falls back to en.",
+       "limit": "Maximum rows to return.",
+@@ -640,12 +649,14 @@
+       "platform": "Which platform the request is addressed to: douyin or tiktok. It must match the link you pass.",
+       "proxy": "Send the upstream request through this proxy, as a full URL such as http://host:port. Refused unless an administrator has enabled security.request_proxy.",
+       "proxy_id": "The proxy to act on.",
++      "publish_time": "Only posts published within this many days: 0 (any time), 1, 7 or 180.",
+       "q": "Substring of the title or description. Matched as a substring rather than by word, so it behaves the same in Chinese as in English.",
+       "refresh": "Ignore any cached or in-flight answer and make the request again. Two things make a repeat return the earlier answer - this instance joins an identical task that is already running or recently finished, and it caches the shaped body - and this turns off both. The fresh answer is still cached. It costs an identity and an upstream request, so it is for checking whether something changed rather than for every call. How long the cached answer lives depends on what was asked for and is set in the console: cache.content_ttl for one post (30 minutes by default), cache.author_ttl for a profile (15 minutes), cache.list_ttl for anything paged (5 minutes). Entries expire on their own and Redis is capped below its container limit, dropping the least recently used expiring keys before it fills, so the cache cannot grow without bound.",
+       "request_id": "Only the request with this id.",
+       "request_log.identity_id": "Only requests made with this identity.",
+       "sec_user_id": "The author's stable id, as an alternative to url. On TikTok this is secUid.",
+       "session_ref": "The session digest from the list endpoint.",
++      "sort_type": "How the platform orders results: 0 by relevance, 1 by most liked, 2 newest first.",
+       "state": "Only entries in this state.",
+       "step": "Bucket width in seconds.",
+       "stored": "True for posts whose media this instance is holding right now, false for the rest. Like `collection` this describes what was kept rather than the post.",
+diff --git a/src/dtk/i18n/locales/zh.json b/src/dtk/i18n/locales/zh.json
+index 9068546..4873cc0 100644
+--- a/src/dtk/i18n/locales/zh.json
++++ b/src/dtk/i18n/locales/zh.json
+@@ -414,6 +414,10 @@
+         "summary": "实例健康状态",
+         "description": "报告数据库、缓存、浏览器 RPC 与身份池的健康状况，可供监控系统轮询。"
+       },
++      "hot_search": {
++        "summary": "热搜榜",
++        "description": "平台的热搜榜，按排名返回：每个热词附带平台给出的热度值，以及平台提供时的封面和相关作品数；旁边的上升热点列表一并返回。仅支持抖音；cache.list_ttl 内的重复请求直接由缓存作答。"
++      },
+       "identities_cookies": {
+         "summary": "查看某个身份的 Cookie 组成",
+         "description": "返回该身份持有的 Cookie 名称、作用分类与掩码后的值，绝不返回真实值。"
+@@ -510,6 +514,10 @@
+         "summary": "读取请求日志",
+         "description": "最近的请求，最新的在前，可按条件筛选。"
+       },
++      "search": {
++        "summary": "按关键词搜索作品",
++        "description": "按关键词返回一页作品，顺序由平台决定：综合排序、最多点赞或最新发布，并可限定最近 1、7 或 180 天。结果页中混有用户卡片和直播卡片，只返回作品，因此一页的条数可能少于 count。仅支持抖音。搜索是平台最先限流的接口，所以它的配额最紧；游客身份也比导入的已登录身份更早遇到验证码。"
++      },
+       "settings_list": {
+         "summary": "读取全部运行时设置",
+         "description": "每一项运行时设置，含当前值及其来源。"
+@@ -626,6 +634,7 @@
+       "include_raw": "在归一化结果之外，同时返回平台自身的原始响应。",
+       "key": "要操作的配置项，取值见列表接口。",
+       "key_id": "要吊销的密钥 ID。",
++      "keyword": "要搜索的关键词，与用户在搜索框里输入的一样。",
+       "kind": "仅返回该类型的条目。",
+       "lang": "人类可读文本的响应语言，可选 en 或 zh，其余值一律回退英文。",
+       "limit": "最多返回多少条。",
+@@ -640,12 +649,14 @@
+       "platform": "请求针对的平台，douyin 或 tiktok，必须与传入的链接一致。",
+       "proxy": "通过该代理发起上游请求，需填写完整 URL，例如 http://host:port。除非管理员启用了 security.request_proxy，否则该参数会被拒绝。",
+       "proxy_id": "要操作的代理 ID。",
++      "publish_time": "仅返回最近若干天内发布的作品：0（不限）、1、7 或 180。",
+       "q": "标题或描述中的子串。按子串匹配而非按词匹配，因此中英文行为一致。",
+       "refresh": "忽略缓存和正在进行中的相同任务，重新发起一次请求。有两个机制会让重复调用拿到上一次的结果——本实例会合并到一个已在运行或刚刚完成的相同任务，以及会缓存整理后的响应体——这个参数会同时关掉两者。新取到的结果仍然会写入缓存。它会消耗一个身份和一次上游请求，适合用来确认内容有没有变化，而不是每次调用都带上。缓存能存多久取决于请求的内容，在控制台里可以改：单个作品用 cache.content_ttl（默认 30 分钟），作者主页用 cache.author_ttl（15 分钟），所有分页接口用 cache.list_ttl（5 分钟）。条目到期自动清除，同时 Redis 设了低于容器上限的内存封顶，快满时会先淘汰最久未用、且带过期时间的键，所以缓存不会无限增长。",
+       "request_id": "仅返回该请求 ID 对应的那一条。",
+       "request_log.identity_id": "仅返回由该身份发出的请求。",
+       "sec_user_id": "作者的稳定 ID，与 url 二选一。在 TikTok 上即 secUid。",
+       "session_ref": "会话摘要，取自列表接口。",
++      "sort_type": "平台的排序方式：0 综合排序，1 最多点赞，2 最新发布。",
+       "state": "仅返回处于该状态的条目。",
+       "step": "分桶宽度，单位为秒。",
+       "stored": "为 true 时仅返回媒体文件当前仍由本实例保存的作品，false 则返回其余的。和 `collection` 一样，它描述的是「留下了什么」而不是作品本身。",
+diff --git a/src/dtk/models/__init__.py b/src/dtk/models/__init__.py
+index ded3dc4..dd2ad94 100644
+--- a/src/dtk/models/__init__.py
++++ b/src/dtk/models/__init__.py
+@@ -5,6 +5,8 @@ from dtk.models.content import (
+     Comment,
+     Content,
+     ContentStats,
++    HotSearchBoard,
++    HotSearchWord,
+     Image,
+     Media,
+     Music,
+@@ -19,6 +21,8 @@ __all__ = [
+     "Comment",
+     "Content",
+     "ContentStats",
++    "HotSearchBoard",
++    "HotSearchWord",
+     "Image",
+     "Media",
+     "Music",
+diff --git a/src/dtk/models/content.py b/src/dtk/models/content.py
+index f94d567..61028cb 100644
+--- a/src/dtk/models/content.py
++++ b/src/dtk/models/content.py
+@@ -192,6 +192,34 @@ class Collection(_Base):
+     raw: dict | None = None
+ 
+ 
++class HotSearchWord(_Base):
++    """One entry on a platform's hot search board."""
++
++    platform: Platform
++    word: str
++    #: 1-based rank on the board.
++    position: int | None = None
++    #: The platform's own heat figure. Comparable within one board only.
++    hot_value: int | None = None
++    #: The platform's badge code (new, hot, ...), kept as the platform sends it.
++    label: int | None = None
++    sentence_id: str | None = None
++    group_id: str | None = None
++    video_count: int | None = None
++    event_time: datetime | None = None
++    cover: Image | None = None
++    raw: dict | None = None
++
++
++class HotSearchBoard(_Base):
++    platform: Platform
++    #: When the platform last refreshed the board, as the platform writes it.
++    active_time: str | None = None
++    items: list[HotSearchWord] = Field(default_factory=list)
++    #: The rising-topics list shown beside the board, when the platform sends one.
++    trending: list[HotSearchWord] = Field(default_factory=list)
++
++
+ class Page[T](BaseModel):
+     """A page of results with an opaque cursor.
+ 
+@@ -213,6 +241,8 @@ __all__ = [
+     "Comment",
+     "Content",
+     "ContentStats",
++    "HotSearchBoard",
++    "HotSearchWord",
+     "Image",
+     "Media",
+     "Music",
+diff --git a/src/dtk/platforms/base.py b/src/dtk/platforms/base.py
+index 1f51021..5f53e29 100644
+--- a/src/dtk/platforms/base.py
++++ b/src/dtk/platforms/base.py
+@@ -37,7 +37,7 @@ from typing import Any, Final, Literal, Protocol, TypedDict, runtime_checkable
+ 
+ from dtk.core.errors import InvalidParam
+ from dtk.core.types import Platform
+-from dtk.models import Author, Collection, Comment, Content, Page
++from dtk.models import Author, Collection, Comment, Content, HotSearchBoard, Page
+ 
+ HttpMethod = Literal["GET", "POST"]
+ 
+@@ -453,6 +453,12 @@ class PlatformAdapter(Protocol):
+         parent_id: str | None = None,
+     ) -> Page[Comment]: ...
+ 
++    def parse_search(
++        self, payload: Mapping[str, Any], *, fetched_at: datetime, cursor: str | None = None
++    ) -> Page[Content]: ...
++
++    def parse_hot_search(self, payload: Mapping[str, Any]) -> HotSearchBoard: ...
++
+ 
+ __all__ = [
+     "ClientProfile",
+diff --git a/src/dtk/platforms/douyin/adapter.py b/src/dtk/platforms/douyin/adapter.py
+index 5a2c272..022478c 100644
+--- a/src/dtk/platforms/douyin/adapter.py
++++ b/src/dtk/platforms/douyin/adapter.py
+@@ -15,7 +15,7 @@ from typing import Any
+ 
+ from dtk.core.errors import UnsupportedContent
+ from dtk.core.types import Platform
+-from dtk.models import Author, Collection, Comment, Content, Page
++from dtk.models import Author, Collection, Comment, Content, HotSearchBoard, Page
+ from dtk.platforms.base import (
+     ClientProfile,
+     EndpointTable,
+@@ -118,6 +118,14 @@ class DouyinAdapter:
+     ) -> list[Comment]:
+         return parser.parse_reply_previews(payload, content_id=content_id)
+ 
++    def parse_search(
++        self, payload: Mapping[str, Any], *, fetched_at: datetime, cursor: str | None = None
++    ) -> Page[Content]:
++        return parser.parse_search(payload, fetched_at=fetched_at, cursor=cursor)
++
++    def parse_hot_search(self, payload: Mapping[str, Any]) -> HotSearchBoard:
++        return parser.parse_hot_search(payload)
++
+ 
+ ADAPTER: PlatformAdapter = DouyinAdapter()
+ 
+diff --git a/src/dtk/platforms/douyin/endpoints.py b/src/dtk/platforms/douyin/endpoints.py
+index 7a7beb3..4f00801 100644
+--- a/src/dtk/platforms/douyin/endpoints.py
++++ b/src/dtk/platforms/douyin/endpoints.py
+@@ -25,7 +25,9 @@ from dtk.platforms.douyin.params import (
+     comment_replies_params,
+     comments_params,
+     content_detail_params,
++    hot_search_params,
+     mix_posts_params,
++    search_params,
+     session_check_params,
+ )
+ 
+@@ -201,6 +203,8 @@ AUTHOR_COLLECTIONS: Final = "douyin.author_collections"
+ COLLECTION_POSTS: Final = "douyin.collection_posts"
+ MIX_POSTS: Final = "douyin.mix_posts"
+ SESSION_CHECK: Final = "douyin.session_check"
++SEARCH: Final = "douyin.search"
++HOT_SEARCH: Final = "douyin.hot_search"
+ 
+ #: Sent on every Douyin request. Cookies and User-Agent are injected by the
+ #: transport from the identity; only the platform-specific referer belongs here.
+@@ -309,6 +313,24 @@ ENDPOINTS: Final = EndpointTable.of(
+         risk_weight=1.5,
+         summary="Replies under one comment",
+     ),
++    EndpointSpec(
++        name=SEARCH,
++        path=DouyinAPIEndpoints.GENERAL_SEARCH,
++        required=("keyword",),
++        build=search_params,
++        # Keyword search is the most scraped surface the platform has and the
++        # one it rate-limits first, so it sits above paging a timeline.
++        risk_weight=2.0,
++        summary="Posts matching a keyword, optionally sorted by likes or recency",
++    ),
++    EndpointSpec(
++        name=HOT_SEARCH,
++        path=DouyinAPIEndpoints.DOUYIN_HOT_SEARCH,
++        required=(),
++        build=hot_search_params,
++        risk_weight=1.0,
++        summary="The hot search board",
++    ),
+ )
+ 
+ 
+@@ -323,6 +345,8 @@ __all__ = [
+     "CONTENT_DETAIL",
+     "DEFAULT_HEADERS",
+     "ENDPOINTS",
++    "HOT_SEARCH",
+     "MIX_POSTS",
++    "SEARCH",
+     "DouyinAPIEndpoints",
+ ]
+diff --git a/src/dtk/platforms/douyin/params.py b/src/dtk/platforms/douyin/params.py
+index 9e5c789..1b92fbb 100644
+--- a/src/dtk/platforms/douyin/params.py
++++ b/src/dtk/platforms/douyin/params.py
+@@ -23,9 +23,11 @@ once, because the signature is computed over the encoded query string.
+ 
+ from __future__ import annotations
+ 
++import json
+ from dataclasses import replace
+ from typing import Final
+ 
++from dtk.core.errors import InvalidParam
+ from dtk.platforms.base import ClientProfile, ProfileSource, browser_version
+ 
+ #: Douyin's web client identifies itself as a Chinese-locale desktop browser.
+@@ -348,6 +350,106 @@ def comment_replies_params(
+     }
+ 
+ 
++#: Douyin's own ``sort_type`` values: relevance, most liked, newest.
++SEARCH_SORT_TYPES: Final[frozenset[int]] = frozenset({0, 1, 2})
++#: Douyin's ``publish_time`` filter, in days; 0 means any time.
++SEARCH_PUBLISH_TIMES: Final[frozenset[int]] = frozenset({0, 1, 7, 180})
++SEARCH_CHANNEL: Final = "aweme_general"
++SEARCH_CURSOR_SEPARATOR: Final = "|"
++
++
++def search_cursor(offset: int, search_id: str | None) -> str:
++    """Encode the two things the next search page needs into one opaque cursor.
++
++    Douyin pages search results by ``offset`` and ties the pages of one query
++    together with ``search_id`` - the ``extra.logid`` of the previous page.
++    Asking for page two without it starts a fresh query that can repeat or
++    skip results, so it travels inside the cursor rather than being dropped.
++    """
++    return f"{offset}{SEARCH_CURSOR_SEPARATOR}{search_id or ''}"
++
++
++def decode_search_cursor(cursor: str | None) -> tuple[int, str]:
++    """``(offset, search_id)`` from :func:`search_cursor`; the first page is ``(0, "")``."""
++    text = (cursor or "").strip()
++    if not text:
++        return 0, ""
++    raw_offset, _, search_id = text.partition(SEARCH_CURSOR_SEPARATOR)
++    try:
++        offset = int(raw_offset)
++    except ValueError:
++        raise InvalidParam(
++            "cursor was not produced by the search endpoint",
++            details={"field": "cursor"},
++        ) from None
++    if offset < 0:
++        raise InvalidParam("cursor offset is negative", details={"field": "cursor"})
++    return offset, search_id
++
++
++def _not_one_of(field: str, allowed: frozenset[int]) -> InvalidParam:
++    return InvalidParam(
++        f"{field} must be one of {sorted(allowed)}",
++        details={"field": field, "allowed": sorted(allowed)},
++    )
++
++
++def _choice(field: str, value: int | str, allowed: frozenset[int]) -> int:
++    try:
++        number = int(value)
++    except (TypeError, ValueError):
++        raise _not_one_of(field, allowed) from None
++    if number not in allowed:
++        raise _not_one_of(field, allowed)
++    return number
++
++
++def search_params(
++    *,
++    keyword: str,
++    sort_type: int | str = 0,
++    publish_time: int | str = 0,
++    cursor: str | None = None,
++    count: int = DEFAULT_PAGE_SIZE,
++    profile: ClientProfile = DEFAULT_PROFILE,
++) -> dict[str, str]:
++    """Parameters for ``/aweme/v1/web/general/search/single/``.
++
++    Sorting and the publish-time window are not separate parameters: the web
++    client sends them together as a JSON ``filter_selected`` and flags the query
++    as filtered, and sends neither for a plain relevance search.
++    """
++    sort = _choice("sort_type", sort_type, SEARCH_SORT_TYPES)
++    window = _choice("publish_time", publish_time, SEARCH_PUBLISH_TIMES)
++    offset, search_id = decode_search_cursor(cursor)
++    filtered = sort != 0 or window != 0
++    params = {
++        **base_params(profile),
++        "search_channel": SEARCH_CHANNEL,
++        "enable_history": "1",
++        "keyword": str(keyword).strip(),
++        "search_source": "tab_search",
++        "query_correct_type": "1",
++        "is_filter_search": "1" if filtered else "0",
++        "from_group_id": "",
++        "offset": str(offset),
++        "count": str(count),
++        "need_filter_settings": "1",
++        "list_type": "multi",
++        "search_id": search_id,
++    }
++    if filtered:
++        params["filter_selected"] = json.dumps(
++            {"sort_type": str(sort), "publish_time": str(window)}, separators=(",", ":")
++        )
++    return params
++
++
++def hot_search_params(*, profile: ClientProfile = DEFAULT_PROFILE) -> dict[str, str]:
++    """Parameters for ``/aweme/v1/web/hot/search/list/``: the base set only, as V4 sent it."""
++    return base_params(profile)
++
++
+ def _cursor(cursor: str | None) -> str:
+     """Decode the opaque page cursor into Douyin's numeric cursor."""
+     if cursor is None:
+@@ -366,5 +468,9 @@ __all__ = [
+     "comment_replies_params",
+     "comments_params",
+     "content_detail_params",
++    "decode_search_cursor",
++    "hot_search_params",
+     "profile_for",
++    "search_cursor",
++    "search_params",
+ ]
+diff --git a/src/dtk/platforms/douyin/parser.py b/src/dtk/platforms/douyin/parser.py
+index ec2e802..f5dc22b 100644
+--- a/src/dtk/platforms/douyin/parser.py
++++ b/src/dtk/platforms/douyin/parser.py
+@@ -38,6 +38,8 @@ from dtk.models import (
+     Comment,
+     Content,
+     ContentStats,
++    HotSearchBoard,
++    HotSearchWord,
+     Image,
+     Media,
+     Music,
+@@ -57,6 +59,7 @@ from dtk.platforms.common import (
+     seconds_to_ms,
+     split_title,
+ )
++from dtk.platforms.douyin.params import decode_search_cursor, search_cursor
+ 
+ _PLATFORM: Final = Platform.DOUYIN
+ _NAME: Final = _PLATFORM.value
+@@ -73,6 +76,10 @@ RISK_STATUS_CODES: Final[frozenset[int]] = frozenset({8, 2154, 2156, 10000, 1000
+ #: Douyin marks self-only (1) and friends-only (2) posts here; 0 is public.
+ _PUBLIC_PRIVATE_STATUS: Final = 0
+ 
++#: What the search endpoint answers, in place of results, when it wants the
++#: session to pass a captcha first: ``search_nil_info.search_nil_type``.
++SEARCH_VERIFY_CHECK: Final = "verify_check"
++
+ 
+ def detect_risk_control(payload: Mapping[str, Any]) -> str | None:
+     """Name the risk-control signature in ``payload``, or ``None``.
+@@ -92,6 +99,9 @@ def detect_risk_control(payload: Mapping[str, Any]) -> str | None:
+         return "verify_center"
+     if payload.get("captcha") or payload.get("verify_page"):
+         return "captcha_page"
++    nil_info = payload.get("search_nil_info")
++    if isinstance(nil_info, Mapping) and nil_info.get("search_nil_type") == SEARCH_VERIFY_CHECK:
++        return "search_verify_check"
+     # A structurally valid envelope whose single payload key was emptied out.
+     # An empty ``aweme_list`` or ``comments`` is legitimate (no posts, no
+     # comments); an empty ``aweme_detail`` or ``user`` never is.
+@@ -398,6 +408,77 @@ def parse_author_posts(payload: Mapping[str, Any], *, fetched_at: datetime) -> P
+     return Page(items=items, cursor=cursor, has_more=has_more)
+ 
+ 
++def _search_post(entry: Node) -> Node | None:
++    """The post inside one search result card, or None for a card that holds none.
++
++    A results page mixes post cards with user, live-room and topic cards; only
++    the first kind carries ``aweme_info``. A mix card carries its posts under
++    ``aweme_mix_info.mix_items`` and is represented by the first of them.
++    """
++    post = entry.opt_child("aweme_info")
++    if post is not None:
++        return post
++    mix = entry.opt_child("aweme_mix_info")
++    mix_items = mix.opt_children("mix_items") if mix is not None else []
++    return mix_items[0] if mix_items else None
++
++
++def parse_search(
++    payload: Mapping[str, Any], *, fetched_at: datetime, cursor: str | None = None
++) -> Page[Content]:
++    """Parse ``/aweme/v1/web/general/search/single/``.
++
++    ``cursor`` is the one this page was requested with; it is only needed when
++    the platform says there is more but omits the next offset, in which case
++    the offset advances by the number of cards on this page. An empty result
++    arrives without ``data`` at all, which is an empty page rather than a
++    schema change.
++    """
++    root = _guard(payload)
++    entries = root.opt_children("data")
++    posts = [post for post in (_search_post(entry) for entry in entries) if post is not None]
++    items = [content_from_node(post, fetched_at=fetched_at) for post in posts]
++    has_more = optional_bool(root.get("has_more"))
++    if not has_more:
++        return Page(items=items, cursor=None, has_more=False)
++    offset = optional_int(root.get("cursor"))
++    if offset is None:
++        offset = decode_search_cursor(cursor)[0] + len(entries)
++    extra = root.opt_child("extra")
++    search_id = optional_str(extra.get("logid")) if extra is not None else None
++    return Page(items=items, cursor=search_cursor(offset, search_id), has_more=True)
++
++
++def _hot_word(node: Node, index: int) -> HotSearchWord:
++    return HotSearchWord(
++        platform=_PLATFORM,
++        word=node.text("word"),
++        position=optional_positive_int(node.get("position")) or index + 1,
++        hot_value=optional_int(node.get("hot_value")),
++        label=optional_int(node.get("label")),
++        sentence_id=optional_id(node.get("sentence_id")),
++        group_id=optional_id(node.get("group_id")),
++        video_count=optional_int(node.get("video_count")),
++        event_time=epoch_to_datetime(node.get("event_time")),
++        cover=image_from_url_list(node.get("word_cover")),
++        raw=node.raw(),
++    )
++
++
++def parse_hot_search(payload: Mapping[str, Any]) -> HotSearchBoard:
++    """Parse ``/aweme/v1/web/hot/search/list/``."""
++    root = _guard(payload)
++    board = root.child("data")
++    return HotSearchBoard(
++        platform=_PLATFORM,
++        active_time=optional_str(board.get("active_time")),
++        items=[_hot_word(node, index) for index, node in enumerate(board.children("word_list"))],
++        trending=[
++            _hot_word(node, index) for index, node in enumerate(board.opt_children("trending_list"))
++        ],
++    )
++
++
+ #: The ``status`` on a ``collects_list`` entry that means "anyone can open it".
+ #:
+ #: Measured 2026-09-14 on one account holding two folders it had set either
+@@ -578,6 +659,7 @@ def parse_reply_previews(
+ 
+ __all__ = [
+     "RISK_STATUS_CODES",
++    "SEARCH_VERIFY_CHECK",
+     "WEB_DOMAIN",
+     "author_from_node",
+     "author_web_url",
+@@ -590,5 +672,7 @@ __all__ = [
+     "parse_comment_replies",
+     "parse_comments",
+     "parse_content",
++    "parse_hot_search",
+     "parse_reply_previews",
++    "parse_search",
+ ]
+diff --git a/src/dtk/platforms/tiktok/adapter.py b/src/dtk/platforms/tiktok/adapter.py
+index 467c280..93d4f3f 100644
+--- a/src/dtk/platforms/tiktok/adapter.py
++++ b/src/dtk/platforms/tiktok/adapter.py
+@@ -11,8 +11,9 @@ from dataclasses import dataclass, field
+ from datetime import datetime
+ from typing import Any
+ 
++from dtk.core.errors import UnsupportedContent
+ from dtk.core.types import Platform
+-from dtk.models import Author, Collection, Comment, Content, Page
++from dtk.models import Author, Collection, Comment, Content, HotSearchBoard, Page
+ from dtk.platforms.base import (
+     ClientProfile,
+     EndpointTable,
+@@ -88,6 +89,21 @@ class TikTokAdapter:
+     ) -> list[Comment]:
+         return parser.parse_reply_previews(payload, content_id=content_id)
+ 
++    def parse_search(
++        self, payload: Mapping[str, Any], *, fetched_at: datetime, cursor: str | None = None
++    ) -> Page[Content]:
++        """No TikTok search endpoint is registered; said here rather than left missing."""
++        raise UnsupportedContent(
++            "TikTok keyword search is not implemented",
++            details={"platform": self.platform.value, "capability": "search"},
++        )
++
++    def parse_hot_search(self, payload: Mapping[str, Any]) -> HotSearchBoard:
++        raise UnsupportedContent(
++            "TikTok has no hot search board endpoint",
++            details={"platform": self.platform.value, "capability": "hot_search"},
++        )
++
+ 
+ ADAPTER: PlatformAdapter = TikTokAdapter()
+ 
+diff --git a/src/dtk/scheduler/policies.py b/src/dtk/scheduler/policies.py
+index e159ff6..8c9f864 100644
+--- a/src/dtk/scheduler/policies.py
++++ b/src/dtk/scheduler/policies.py
+@@ -61,6 +61,10 @@ _POLICIES: dict[str, EndpointPolicy] = {
+             "douyin.author_collections", capacity=3, refill_per_sec=0.12, risk_weight=1.8
+         ),
+         EndpointPolicy("douyin.collection_posts", capacity=3, refill_per_sec=0.15, risk_weight=1.5),
++        # Keyword search is the first thing the platform throttles, so it is
++        # held below paging a timeline; the board changes slowly and is cached.
++        EndpointPolicy("douyin.search", capacity=3, refill_per_sec=0.10, risk_weight=2.0),
++        EndpointPolicy("douyin.hot_search", capacity=2, refill_per_sec=0.05, risk_weight=1.0),
+         EndpointPolicy("tiktok.content_detail", capacity=5, refill_per_sec=0.30, risk_weight=1.0),
+         EndpointPolicy("tiktok.author_profile", capacity=4, refill_per_sec=0.20, risk_weight=1.2),
+         EndpointPolicy("tiktok.author_posts", capacity=3, refill_per_sec=0.12, risk_weight=1.8),
+diff --git a/src/dtk/worker/registry.py b/src/dtk/worker/registry.py
+index 737bc7a..39c62bc 100644
+--- a/src/dtk/worker/registry.py
++++ b/src/dtk/worker/registry.py
+@@ -67,6 +67,8 @@ class Capability(StrEnum):
+     MIX_POSTS = "mix_posts"
+     AUTHOR_FOLLOWERS = "author_followers"
+     AUTHOR_FOLLOWING = "author_following"
++    SEARCH = "search"
++    HOT_SEARCH = "hot_search"
+ 
+ 
+ #: The P0 set from docs/design/11-data-contracts.md. A platform is only usable
+@@ -124,6 +126,9 @@ def looks_like_sec_uid(value: str) -> bool:
+ COMMENT_ID: Final = "comment_id"
+ CURSOR: Final = "cursor"
+ COUNT: Final = "count"
++KEYWORD: Final = "keyword"
++SORT_TYPE: Final = "sort_type"
++PUBLISH_TIME: Final = "publish_time"
+ 
+ #: Platform spellings accepted for a canonical name. ``aweme_id`` and
+ #: ``item_id`` are the same thing on both platforms as far as a caller is
+@@ -211,6 +216,15 @@ _ARGUMENTS: Final[Mapping[Platform, Mapping[Capability, Mapping[str, str]]]] = {
+             CURSOR: "cursor",
+             COUNT: "count",
+         },
++        Capability.SEARCH: {
++            KEYWORD: "keyword",
++            SORT_TYPE: "sort_type",
++            PUBLISH_TIME: "publish_time",
++            CURSOR: "cursor",
++            COUNT: "count",
++        },
++        # Mapped, and mapped to nothing: the board takes no arguments at all.
++        Capability.HOT_SEARCH: {},
+     },
+     Platform.TIKTOK: {
+         Capability.CONTENT_DETAIL: {CONTENT_ID: "item_id"},
+@@ -260,6 +274,8 @@ _CACHE_TTL_KEYS: Final[Mapping[Capability, str]] = MappingProxyType(
+         Capability.MIX_POSTS: "cache.list_ttl",
+         Capability.AUTHOR_FOLLOWERS: "cache.list_ttl",
+         Capability.AUTHOR_FOLLOWING: "cache.list_ttl",
++        Capability.SEARCH: "cache.list_ttl",
++        Capability.HOT_SEARCH: "cache.list_ttl",
+     }
+ )
+ 
+@@ -454,6 +470,10 @@ class EndpointDefinition:
+                     content_id=content_id,
+                     parent_id=canonical.get(COMMENT_ID),
+                 )
++            case Capability.SEARCH:
++                return adapter.parse_search(payload, fetched_at=when, cursor=canonical.get(CURSOR))
++            case Capability.HOT_SEARCH:
++                return adapter.parse_hot_search(payload)
+         raise InvalidParam(  # pragma: no cover - unreachable while Capability is closed
+             f"no parser bound for {self.name}", details={"endpoint": self.name}
+         )
+@@ -513,10 +533,11 @@ def _definition(
+     if name not in adapter.endpoints:
+         return None
+     spec = adapter.endpoints[name]
+-    arguments = dict(_ARGUMENTS.get(platform, {}).get(capability, {}))
+-    if not arguments:
++    mapped = _ARGUMENTS.get(platform, {}).get(capability)
++    if mapped is None:
+         log.warning("worker.registry.unmapped_arguments", endpoint=name)
+         return None
++    arguments = dict(mapped)
+ 
+     # The argument map is the one place where this table can drift away from a
+     # platform package. Checking it against the real builder signature turns
+@@ -607,8 +628,11 @@ __all__ = [
+     "CURSOR",
+     "ENDPOINTS",
+     "ENVELOPE_PARAMS",
++    "KEYWORD",
+     "OPTIONAL_CAPABILITIES",
+     "P0_CAPABILITIES",
++    "PUBLISH_TIME",
++    "SORT_TYPE",
+     "UNIQUE_ID",
+     "Capability",
+     "EndpointDefinition",
+diff --git a/tests/replay/test_douyin_search.py b/tests/replay/test_douyin_search.py
+new file mode 100644
+index 0000000..a483252
+--- /dev/null
++++ b/tests/replay/test_douyin_search.py
+@@ -0,0 +1,276 @@
++"""Keyword search and the hot search board: parsing, request building, wiring.
++
++The result pages are assembled from the ``video_normal`` fixture rather than
++kept as fixtures of their own: the replay fixture set is shared by every
++platform and must stay identical across them (see test_platform_contract).
++"""
++
++from __future__ import annotations
++
++import json
++from copy import deepcopy
++from datetime import UTC, datetime
++from typing import Any
++
++import pytest
++
++from dtk.core.errors import ErrorCode, UnsupportedContent, UpstreamChanged, UpstreamRiskControl
++from dtk.platforms import get_adapter
++from dtk.platforms.douyin import ADAPTER, endpoints, parser
++from dtk.platforms.douyin.params import decode_search_cursor, search_cursor
++from dtk.worker import registry
++from tests.replay.support import FETCHED_AT, load
++
++NORMAL_ID = "7000000000000000001"
++LOGID = "2026092812000001"
++COVER = "https://p3-sign.example-cdn.invalid/hotsearch/alpha.jpeg"
++
++
++def _aweme() -> dict[str, Any]:
++    return deepcopy(load("douyin", "video_normal")["aweme_detail"])
++
++
++def _search_page(**overrides: Any) -> dict[str, Any]:
++    page: dict[str, Any] = {
++        "status_code": 0,
++        "data": [
++            {"type": 1, "aweme_info": _aweme()},
++            {"type": 4, "user_list": [{"user_info": {"nickname": "a user card"}}]},
++            {"type": 16, "aweme_mix_info": {"mix_items": [_aweme()]}},
++        ],
++        "has_more": 1,
++        "cursor": 12,
++        "extra": {"logid": LOGID},
++    }
++    page.update(overrides)
++    return page
++
++
++def _hot_board() -> dict[str, Any]:
++    return {
++        "status_code": 0,
++        "data": {
++            "active_time": "2026-09-28 12:00:00",
++            "word_list": [
++                {
++                    "word": "alpha",
++                    "hot_value": 11813424,
++                    "position": 1,
++                    "label": 3,
++                    "sentence_id": "1690766",
++                    "group_id": "7366000000000000001",
++                    "event_time": 1790582400,
++                    "video_count": 12,
++                    "word_cover": {"url_list": [COVER]},
++                },
++                {"word": "beta", "hot_value": 9000000},
++            ],
++            "trending_list": [{"word": "gamma", "position": 1}],
++        },
++    }
++
++
++# --------------------------------------------------------------------------
++# Search results
++# --------------------------------------------------------------------------
++
++
++def test_search_returns_the_posts_and_skips_other_cards() -> None:
++    page = parser.parse_search(_search_page(), fetched_at=FETCHED_AT)
++
++    assert [item.content_id for item in page.items] == [NORMAL_ID, NORMAL_ID]
++    assert all(item.fetched_at == FETCHED_AT for item in page.items)
++    assert page.has_more is True
++    assert page.cursor == f"12|{LOGID}"
++
++
++def test_the_last_page_has_no_cursor() -> None:
++    page = parser.parse_search(_search_page(has_more=0), fetched_at=FETCHED_AT)
++
++    assert page.has_more is False
++    assert page.cursor is None
++
++
++def test_a_missing_next_offset_advances_by_the_cards_on_the_page() -> None:
++    payload = _search_page()
++    del payload["cursor"]
++
++    page = parser.parse_search(payload, fetched_at=FETCHED_AT, cursor="10|previous")
++
++    assert page.cursor == f"13|{LOGID}"
++
++
++def test_no_results_is_an_empty_page_rather_than_a_schema_change() -> None:
++    page = parser.parse_search({"status_code": 0, "has_more": 0}, fetched_at=FETCHED_AT)
++
++    assert page.items == []
++    assert page.cursor is None
++
++
++def test_a_captcha_demand_is_risk_control() -> None:
++    payload = {
++        "status_code": 0,
++        "data": [],
++        "search_nil_info": {"search_nil_type": parser.SEARCH_VERIFY_CHECK},
++    }
++
++    assert parser.detect_risk_control(payload) == "search_verify_check"
++    with pytest.raises(UpstreamRiskControl):
++        parser.parse_search(payload, fetched_at=FETCHED_AT)
++
++
++def test_a_post_card_missing_its_id_is_reported_not_skipped() -> None:
++    payload = _search_page()
++    del payload["data"][0]["aweme_info"]["aweme_id"]
++
++    with pytest.raises(UpstreamChanged) as excinfo:
++        parser.parse_search(payload, fetched_at=FETCHED_AT)
++    assert excinfo.value.path == "data[0].aweme_info.aweme_id"
++
++
++# --------------------------------------------------------------------------
++# Hot search board
++# --------------------------------------------------------------------------
++
++
++def test_hot_board_entries_keep_rank_heat_and_cover() -> None:
++    board = parser.parse_hot_search(_hot_board())
++
++    assert board.active_time == "2026-09-28 12:00:00"
++    first, second = board.items
++    assert (first.word, first.position, first.hot_value, first.label) == ("alpha", 1, 11813424, 3)
++    assert first.sentence_id == "1690766"
++    assert first.video_count == 12
++    assert first.event_time == datetime(2026, 9, 28, 8, 0, tzinfo=UTC)
++    assert first.cover is not None and first.cover.url == COVER
++    assert (second.word, second.position, second.cover) == ("beta", 2, None)
++    assert [word.word for word in board.trending] == ["gamma"]
++
++
++def test_hot_board_without_its_word_list_is_a_schema_change() -> None:
++    with pytest.raises(UpstreamChanged) as excinfo:
++        parser.parse_hot_search({"status_code": 0, "data": {"active_time": "x"}})
++    assert excinfo.value.path == "data.word_list"
++
++
++# --------------------------------------------------------------------------
++# Request building
++# --------------------------------------------------------------------------
++
++
++def test_cursor_round_trips() -> None:
++    assert decode_search_cursor(search_cursor(15, "abc")) == (15, "abc")
++    assert decode_search_cursor(None) == (0, "")
++    assert decode_search_cursor("30") == (30, "")
++
++
++def test_plain_search_request_is_not_flagged_as_filtered() -> None:
++    spec = ADAPTER.build_request(endpoints.SEARCH, keyword=" camping ")
++
++    assert spec["url"] == "https://www.douyin.com/aweme/v1/web/general/search/single/"
++    params = spec["params"]
++    assert params["keyword"] == "camping"
++    assert (params["offset"], params["search_id"], params["is_filter_search"]) == ("0", "", "0")
++    assert "filter_selected" not in params
++    assert params["aid"] == "6383"
++    assert "a_bogus" not in params
++
++
++def test_sorting_and_time_window_travel_as_one_filter() -> None:
++    spec = ADAPTER.build_request(
++        endpoints.SEARCH,
++        keyword="camping",
++        sort_type=1,
++        publish_time="7",
++        cursor=search_cursor(20, LOGID),
++        count=10,
++    )
++
++    params = spec["params"]
++    assert params["is_filter_search"] == "1"
++    assert json.loads(params["filter_selected"]) == {"sort_type": "1", "publish_time": "7"}
++    assert (params["offset"], params["search_id"], params["count"]) == ("20", LOGID, "10")
++
++
++@pytest.mark.parametrize(
++    "arguments",
++    [
++        {"keyword": "x", "sort_type": 9},
++        {"keyword": "x", "publish_time": 30},
++        {"keyword": "x", "cursor": "not-an-offset|id"},
++        {"keyword": "x", "cursor": "-5|id"},
++    ],
++)
++def test_invalid_search_arguments_are_bad_parameters(arguments: dict[str, Any]) -> None:
++    from dtk.core.errors import DtkError
++
++    with pytest.raises(DtkError) as excinfo:
++        ADAPTER.build_request(endpoints.SEARCH, **arguments)
++    assert excinfo.value.code is ErrorCode.INVALID_PARAM
++
++
++def test_hot_board_request_carries_the_base_parameters_only() -> None:
++    spec = ADAPTER.build_request(endpoints.HOT_SEARCH)
++
++    assert spec["url"] == "https://www.douyin.com/aweme/v1/web/hot/search/list/"
++    assert spec["params"]["device_platform"] == "webapp"
++    assert "keyword" not in spec["params"]
++
++
++# --------------------------------------------------------------------------
++# Registry wiring
++# --------------------------------------------------------------------------
++
++
++def test_search_is_registered_with_its_canonical_parameters() -> None:
++    definition = registry.ENDPOINTS["douyin.search"]
++
++    assert definition.required == (registry.KEYWORD,)
++    assert set(definition.accepts) == {
++        registry.KEYWORD,
++        registry.SORT_TYPE,
++        registry.PUBLISH_TIME,
++        registry.CURSOR,
++        registry.COUNT,
++    }
++    assert definition.cache_ttl_key == "cache.list_ttl"
++    assert "tiktok.search" not in registry.ENDPOINTS
++
++
++def test_the_argumentless_board_is_registered_too() -> None:
++    definition = registry.ENDPOINTS["douyin.hot_search"]
++
++    assert definition.accepts == ()
++    assert definition.required == ()
++    assert definition.canonical_params({"include_raw": True}) == {}
++
++
++def test_search_parses_through_the_registry_with_the_request_cursor() -> None:
++    definition = registry.ENDPOINTS["douyin.search"]
++    payload = _search_page()
++    del payload["cursor"]
++
++    page = definition.parse(payload, params={"keyword": "camping", "cursor": "3|x"})
++
++    assert page.cursor == f"6|{LOGID}"
++    assert definition.platform_params({"keyword": "camping", "count": "10"}) == {
++        "keyword": "camping",
++        "count": 10,
++    }
++
++
++def test_search_rejects_parameters_it_does_not_have() -> None:
++    from dtk.core.errors import DtkError
++
++    with pytest.raises(DtkError) as excinfo:
++        registry.ENDPOINTS["douyin.search"].canonical_params({"keyword": "x", "aweme_id": "1"})
++    assert excinfo.value.code is ErrorCode.INVALID_PARAM
++
++
++def test_tiktok_says_it_has_neither() -> None:
++    adapter = get_adapter("tiktok")
++
++    with pytest.raises(UnsupportedContent):
++        adapter.parse_search({}, fetched_at=FETCHED_AT)
++    with pytest.raises(UnsupportedContent):
++        adapter.parse_hot_search({})

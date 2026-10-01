@@ -1,0 +1,14 @@
+.git
+.venv
+.upstream
+.build
+.pytest_cache
+.ruff_cache
+**/__pycache__
+**/*.py[cod]
+data
+deploy
+docs
+patches
+tests
+.env

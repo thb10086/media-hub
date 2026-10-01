@@ -1,0 +1,41 @@
+# Layered over DTK's own docker/compose.yml by deploy/deploy.sh:
+#   docker compose -p mediahub-dtk -f .build/dtk/docker/compose.yml -f deploy/dtk.override.yml ...
+#
+# The api joins the shared network under a stable alias so the gateway can
+# reach it, and every service gets ceilings for a small host shared with other
+# products (DTK's defaults assume a dedicated 8 GB machine). A raised
+# oom_score_adj makes the kernel reclaim this stack first under memory pressure.
+# The redis maxmemory that pairs with the lower ceiling is DTK_REDIS_MAXMEMORY.
+services:
+  postgres:
+    mem_limit: 512m
+    cpus: 1.0
+    oom_score_adj: 500
+  redis:
+    mem_limit: 128m
+    cpus: 0.25
+    oom_score_adj: 500
+  migrate:
+    oom_score_adj: 500
+  api:
+    mem_limit: 384m
+    cpus: 1.0
+    oom_score_adj: 500
+    networks:
+      shared:
+        aliases:
+          - dtk-api
+  worker:
+    mem_limit: 384m
+    cpus: 1.0
+    oom_score_adj: 500
+  downloader:
+    mem_limit: 128m
+    memswap_limit: 256m
+    cpus: 0.5
+    oom_score_adj: 500
+
+networks:
+  shared:
+    external: true
+    name: ${HUB_SHARED_NETWORK:-mediahub-shared}

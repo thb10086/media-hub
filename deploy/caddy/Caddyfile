@@ -1,0 +1,7 @@
+# Used only with `--profile tls`. Caddy obtains and renews the certificate for
+# HUB_DOMAIN by itself; ports 80 and 443 must be reachable from the internet and
+# the domain must resolve to this server (ICP filing required in mainland China).
+{$HUB_DOMAIN} {
+	encode gzip
+	reverse_proxy gateway:8080
+}
