@@ -5,6 +5,7 @@
 #   deploy/deploy.sh status               container status of both stacks
 #   deploy/deploy.sh logs [service...]    follow media-hub logs (gateway, worker, sau, ...)
 #   deploy/deploy.sh tenant NAME [CIDR]   create the tenant if needed and issue an API key
+#   deploy/deploy.sh guest-identity       add a guest Douyin identity to DTK's pool (hot board, details, downloads)
 #   deploy/deploy.sh down                 stop both stacks; volumes and data are kept
 #
 # Overrides (environment):
@@ -22,7 +23,8 @@ DTK_ENV="$DEPLOY/dtk.env"
 DTK_ADMIN_FILE="$DEPLOY/dtk-admin.txt"
 DTK_ADMIN_USER="admin"
 DTK_GATEWAY_KEY_NAME="media-hub-gateway"
-DTK_GATEWAY_SCOPES='["douyin:read","media:read","media:write"]'
+# identity:manage lets the gateway import QR-bound Douyin accounts into DTK's identity pool.
+DTK_GATEWAY_SCOPES='["douyin:read","media:read","media:write","identity:manage"]'
 DTK_GATEWAY_RATE_LIMIT=6000
 DTK_INTERNAL_URL="http://dtk-api:8000"
 # Distinct names so the stacks never collide with other compose projects on the host.
@@ -69,6 +71,23 @@ set_env_value() {
 # Print data.<field> of a DTK response envelope read from stdin.
 json_field() {
     python3 -c 'import json, sys; print(json.load(sys.stdin)["data"][sys.argv[1]])' "$1"
+}
+
+dtk_console() { printf 'http://127.0.0.1:%s' "$DTK_BIND_PORT"; }
+
+# dtk_admin_login JAR: a console session for the administrator in deploy/dtk-admin.txt.
+dtk_admin_login() {
+    local password
+    password=$(sed -n 's/^password=//p' "$DTK_ADMIN_FILE")
+    curl -fsS -c "$1" -X POST "$(dtk_console)/api/v1/auth/login" -H 'Content-Type: application/json' \
+        -d "{\"username\":\"$DTK_ADMIN_USER\",\"password\":\"$password\"}" >/dev/null
+}
+
+# issue_gateway_key JAR: print a new gateway key (shown once by DTK).
+issue_gateway_key() {
+    curl -fsS -b "$1" -X POST "$(dtk_console)/api/v1/admin/api-keys" -H 'Content-Type: application/json' \
+        -d "{\"name\":\"$DTK_GATEWAY_KEY_NAME\",\"scopes\":$DTK_GATEWAY_SCOPES,\"rate_limit\":$DTK_GATEWAY_RATE_LIMIT}" |
+        json_field key
 }
 
 # Values DTK's compose file interpolates; they are not read from its env_file.
@@ -217,7 +236,8 @@ build_dtk_image() {
 bootstrap_dtk() {
     [[ -z "$(env_value HUB_DTK_API_KEY)" ]] || return 0
     command -v python3 >/dev/null || die "python3 is required to bootstrap DTK"
-    local console="http://127.0.0.1:${DTK_BIND_PORT}" initialized token password jar key
+    local console initialized token password jar key
+    console=$(dtk_console)
     initialized=$(curl -fsS "$console/api/setup/status" | json_field initialized)
     if [[ "$initialized" == "False" ]]; then
         log "creating the DTK console administrator (login saved to deploy/dtk-admin.txt)"
@@ -230,18 +250,54 @@ bootstrap_dtk() {
             -d "{\"token\":\"$token\",\"username\":\"$DTK_ADMIN_USER\",\"password\":\"$password\"}" >/dev/null
     else
         [[ -f "$DTK_ADMIN_FILE" ]] || die "DTK is already initialized; set HUB_DTK_API_KEY in deploy/.env by hand"
-        password=$(sed -n 's/^password=//p' "$DTK_ADMIN_FILE")
     fi
     jar=$(mktemp)
-    curl -fsS -c "$jar" -X POST "$console/api/v1/auth/login" -H 'Content-Type: application/json' \
-        -d "{\"username\":\"$DTK_ADMIN_USER\",\"password\":\"$password\"}" >/dev/null
-    key=$(curl -fsS -b "$jar" -X POST "$console/api/v1/admin/api-keys" -H 'Content-Type: application/json' \
-        -d "{\"name\":\"$DTK_GATEWAY_KEY_NAME\",\"scopes\":$DTK_GATEWAY_SCOPES,\"rate_limit\":$DTK_GATEWAY_RATE_LIMIT}" |
-        json_field key)
+    dtk_admin_login "$jar"
+    key=$(issue_gateway_key "$jar")
     rm -f "$jar"
     set_env_value HUB_DTK_BASE_URL "$DTK_INTERNAL_URL"
     set_env_value HUB_DTK_API_KEY "$key"
     log "issued the gateway's DTK API key into deploy/.env"
+}
+
+# Keys never gain scopes, so a gateway key issued before identity:manage was needed is
+# replaced: the new key goes into deploy/.env here, and the old one is revoked by
+# revoke_replaced_gateway_key once the gateway runs on the new one.
+REPLACED_KEY_PREFIX=""
+ensure_gateway_key_scopes() {
+    local key status jar
+    key=$(env_value HUB_DTK_API_KEY)
+    [[ -n "$key" ]] || return 0
+    # A dry-run import stores nothing: 200 means the key may import, 403 means it lacks the scope.
+    status=$(curl -sS -o /dev/null -w '%{http_code}' -X POST "$(dtk_console)/api/v1/admin/identities/import" \
+        -H "X-API-Key: $key" -H 'Content-Type: application/json' \
+        -d '{"platform":"douyin","cookies":"ttwid=scope-probe","dry_run":true}')
+    [[ "$status" == 403 ]] || return 0
+    [[ -f "$DTK_ADMIN_FILE" ]] ||
+        die "the gateway's DTK key lacks identity:manage; issue one with $DTK_GATEWAY_SCOPES and put it in deploy/.env"
+    log "replacing the gateway's DTK key with one that may import identities"
+    jar=$(mktemp)
+    dtk_admin_login "$jar"
+    set_env_value HUB_DTK_API_KEY "$(issue_gateway_key "$jar")"
+    rm -f "$jar"
+    REPLACED_KEY_PREFIX=$(sed -n 's/^dtk_\([0-9a-f]*\)_.*/\1/p' <<<"$key")
+}
+
+revoke_replaced_gateway_key() {
+    [[ -n "$REPLACED_KEY_PREFIX" ]] || return 0
+    local jar id
+    jar=$(mktemp)
+    dtk_admin_login "$jar"
+    id=$(curl -fsS -b "$jar" "$(dtk_console)/api/v1/admin/api-keys" | python3 -c '
+import json, sys
+keys = json.load(sys.stdin)["data"]
+print(next((k["id"] for k in keys if k["prefix"] == sys.argv[1] and k["status"] == "active"), ""))
+' "$REPLACED_KEY_PREFIX")
+    if [[ -n "$id" ]]; then
+        curl -fsS -b "$jar" -X DELETE "$(dtk_console)/api/v1/admin/api-keys/$id" >/dev/null
+        log "revoked the replaced gateway DTK key ($REPLACED_KEY_PREFIX...)"
+    fi
+    rm -f "$jar"
 }
 
 # wait_healthy COMPOSE_FUNCTION SERVICE
@@ -271,8 +327,9 @@ Remaining one-time steps:
  1. Open the DTK console through an SSH tunnel (it only listens on loopback) and log in
     with the account in deploy/dtk-admin.txt:
       ssh -L ${DTK_BIND_PORT}:127.0.0.1:${DTK_BIND_PORT} <user>@<server>   then browse http://127.0.0.1:${DTK_BIND_PORT}
- 2. In the console, import at least one logged-in Douyin cookie into the identity pool.
-    Douyin data endpoints answer UPSTREAM_UNAVAILABLE until an identity exists.
+ 2. Douyin data endpoints answer UPSTREAM_UNAVAILABLE until DTK's identity pool has an
+    identity. Binding a Douyin account by QR code (step 4) imports its login automatically;
+    a cookie can also be imported by hand in the console.
  3. Issue the key your product backend will use (the key is printed once):
       deploy/deploy.sh tenant <tenant-name> <backend-egress-ip>/32
  4. Bind publishing accounts: POST /api/v1/accounts/login-sessions (QR code, polled), see docs/API.md.
@@ -295,6 +352,7 @@ cmd_up() {
     dtk_compose up -d --no-build --remove-orphans
     wait_healthy dtk_compose api
     bootstrap_dtk
+    ensure_gateway_key_scopes
 
     export SAU_COMMIT
     local profiles=()
@@ -305,6 +363,7 @@ cmd_up() {
     hub_compose "${profiles[@]}" up -d --build --remove-orphans
     wait_healthy hub_compose gateway
     wait_healthy hub_compose sau
+    revoke_replaced_gateway_key
     next_steps
 }
 
@@ -333,6 +392,15 @@ cmd_tenant() {
     log "API key issued; it is in ${output#"$ROOT"/} (view with: cat ${output#"$ROOT"/})"
 }
 
+# A guest jar from SAU's browser, imported by the gateway's CLI: the hot board, details and
+# downloads work before anyone binds an account. Search needs a logged-in identity, which
+# every QR-bound Douyin account adds by itself (HUB_DATA_IDENTITY_FROM_LOGINS).
+cmd_guest_identity() {
+    log "opening www.douyin.com in SAU's browser for a guest identity"
+    hub_compose exec -T sau python /usr/local/share/sau-patches/guest-jar.py |
+        hub_compose exec -T gateway media-hub import-jar -
+}
+
 cmd_down() {
     export_dtk_vars
     hub_compose --profile tls down
@@ -351,9 +419,10 @@ main() {
         status) cmd_status ;;
         logs) hub_compose logs -f --tail=200 "$@" ;;
         tenant) cmd_tenant "$@" ;;
+        guest-identity) cmd_guest_identity ;;
         down) cmd_down ;;
         *)
-            sed -n '2,13p' "${BASH_SOURCE[0]}" >&2
+            sed -n '2,14p' "${BASH_SOURCE[0]}" >&2
             exit 64
             ;;
     esac

@@ -37,6 +37,7 @@ from hub.providers.sau import SauClient
 from hub.security.net import parse_networks
 from hub.security.ratelimit import RateLimiter
 from hub.services.cache import ResponseCache
+from hub.services.data_identities import build_data_identities
 from hub.services.usage import record_usage
 from hub.settings import Settings, get_settings
 
@@ -217,6 +218,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.sau_base_url
         else None
     )
+    state.identities = build_data_identities(settings, state.dtk, state.sau)
     state.channels = build_channels_provider(settings.channels_provider)
     state.login_slots = asyncio.Semaphore(settings.login_max_concurrency)
     state.background_tasks = set()

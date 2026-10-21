@@ -66,13 +66,24 @@ deploy/deploy.sh up
 
 脚本会：拉取钉死版本的 DTK / SAU 源码 → 打 DTK 补丁 → 生成 `deploy/.env` 与 `deploy/dtk.env`（随机密钥，权限 600）→ 在 DTK 官方镜像上叠加补丁构建 → 启动两套编排 → 等待健康检查 → 打印后续步骤：
 
-1. 通过 SSH 隧道打开 DTK 控制台，初始化管理员；
-2. 在身份池导入至少一个已登录的抖音 Cookie，创建 API Key（scope：`douyin:read`、`media:read`、`media:write`）；
-3. 把 Key 写入 `deploy/.env` 的 `HUB_DTK_BASE_URL` / `HUB_DTK_API_KEY`，再执行 `deploy/deploy.sh up`；
-4. 为产品后端签发 Key：`deploy/deploy.sh tenant <租户名> <出口IP>/32`；
-5. 调用 `GET /api/v1/accounts/login` 扫码绑定发布账号。
+1. DTK 首次启动时自动初始化管理员（`deploy/dtk-admin.txt`）并签发网关用的 DTK Key（scope：`douyin:read`、`media:read`、`media:write`、`identity:manage`，写入 `deploy/.env`）。旧 Key 缺 `identity:manage` 时，`up` 会自动换新 Key 并在网关切换后吊销旧的；
+2. 给身份池放入第一个身份：`deploy/deploy.sh guest-identity`（用 SAU 的浏览器生成游客身份，热榜、作品详情、下载即可用）；
+3. 为产品后端签发 Key：`deploy/deploy.sh tenant <租户名> <出口IP>/32`；
+4. 扫码绑定抖音发布账号（`POST /api/v1/accounts/login-sessions`）：登录态同时导入身份池，搜索从此可用（搜索需要登录态，游客身份不行）。
 
 其他命令：`deploy/deploy.sh status | logs [服务] | down`（`down` 不删除数据卷）。
+
+#### 身份池怎么来
+
+DTK 用身份池里的抖音网页端 Cookie 给数据请求签名，池子空时数据接口返回 `UPSTREAM_UNAVAILABLE`（`IDENTITY_POOL_EXHAUSTED`）。三个来源：
+
+| 来源 | 能做什么 | 怎么来 |
+|---|---|---|
+| 扫码绑定的抖音账号 | 全部，含搜索 | 自动：登录成功后网关从 SAU 读回登录态并导入（`HUB_DATA_IDENTITY_FROM_LOGINS`，默认开）；删除账号时退役；失败由 worker 重试，`media-hub sync-identities` 可手动补一遍 |
+| 游客身份 | 热榜、作品详情、下载（搜索不行） | `deploy/deploy.sh guest-identity` |
+| 手动导入 | 看 Cookie 本身 | DTK 控制台，或 `media-hub import-jar <Playwright storage state>` |
+
+SAU 浏览器的 User-Agent 和交给 DTK 的必须一致（DTK 按它选 TLS 指纹），compose 用同一个 `HUB_DOUYIN_USER_AGENT` 同时设置两边，升级 SAU 的 Playwright 时一起改。
 
 ### 3. 对外暴露
 
@@ -88,7 +99,7 @@ deploy/deploy.sh up
 | hub：gateway（2 进程）/ worker / postgres / redis | ≈ 250 MB | 512M / 256M / 384M / 96M |
 | SAU（发布时启动 Chromium） | 空闲 ≈ 150 MB，发布时 +0.5–1 GB | 1.5G |
 
-发布串行执行（`HUB_WORKER_CONCURRENCY=1`）；DTK 的浏览器身份铸造容器（预热后约 2.6G）在 4G 机器上不启用，身份靠手动导入 Cookie。
+发布串行执行（`HUB_WORKER_CONCURRENCY=1`）；DTK 的浏览器身份铸造容器（预热后约 2.6G）在 4G 机器上不启用，身份来自扫码绑定的账号、`guest-identity` 和手动导入。
 
 ### 5. 扩容路线
 

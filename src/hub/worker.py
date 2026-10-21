@@ -1,7 +1,9 @@
 """Background worker: ``python -m hub.worker``.
 
 Runs publishing tasks. Several processes may run against one database; the
-claim query hands each task to exactly one of them.
+claim query hands each task to exactly one of them. It also keeps DTK's
+identity pool in step with the bound Douyin accounts (services/data_identities):
+imports the ones still missing, retries failures, finishes retirements.
 """
 
 from __future__ import annotations
@@ -22,7 +24,9 @@ from hub.errors import ErrorCode, HubError
 from hub.http import outbound_client
 from hub.log import setup_logging
 from hub.models import Task, Tenant
+from hub.providers.dtk import DtkClient
 from hub.providers.sau import SauClient
+from hub.services.data_identities import DataIdentities, build_data_identities
 from hub.services.publishing import run_publish
 from hub.services.tasks import claim_next, fail_stale, mark_failed, mark_succeeded
 from hub.services.webhooks import deliver
@@ -44,12 +48,14 @@ class Worker:
         sau: SauClient,
         http: httpx.AsyncClient,
         handlers: Mapping[str, Handler] = HANDLERS,
+        identities: DataIdentities | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._sau = sau
         self._http = http
         self._handlers = handlers
+        self._identities = identities
 
     async def run_once(self) -> bool:
         """Claim and run one task; False when the queue was empty."""
@@ -115,6 +121,15 @@ class Worker:
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=self._settings.worker_poll_seconds)
 
+    async def _identity_loop(self, stop: asyncio.Event, identities: DataIdentities) -> None:
+        while not stop.is_set():
+            try:
+                await identities.sync(self._session_factory)
+            except Exception:
+                log.exception("worker.identity_sync_error")
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(stop.wait(), timeout=self._settings.data_identity_sync_seconds)
+
     async def run(self, stop: asyncio.Event) -> None:
         async with self._session_factory() as session:
             failed = await fail_stale(
@@ -124,7 +139,10 @@ class Worker:
             )
         if failed:
             log.warning("worker.stale_tasks_failed", extra={"count": failed})
-        await asyncio.gather(*(self._loop(stop) for _ in range(self._settings.worker_concurrency)))
+        loops = [self._loop(stop) for _ in range(self._settings.worker_concurrency)]
+        if self._identities is not None:
+            loops.append(self._identity_loop(stop, self._identities))
+        await asyncio.gather(*loops)
 
 
 def _install_signal_handlers(stop: asyncio.Event) -> None:
@@ -150,13 +168,35 @@ async def _main() -> None:
         video_dir=settings.sau_video_dir,
     )
     http = outbound_client(settings)
+    dtk = (
+        DtkClient(
+            settings.dtk_base_url,
+            settings.dtk_api_key.get_secret_value() if settings.dtk_api_key else "",
+            wait_seconds=settings.dtk_wait_seconds,
+            timeout=settings.dtk_timeout_seconds,
+        )
+        if settings.dtk_base_url
+        else None
+    )
+    identities = build_data_identities(settings, dtk, sau)
     stop = asyncio.Event()
     _install_signal_handlers(stop)
-    worker = Worker(settings, session_factory=create_session_factory(engine), sau=sau, http=http)
-    log.info("worker.started", extra={"concurrency": settings.worker_concurrency})
+    worker = Worker(
+        settings,
+        session_factory=create_session_factory(engine),
+        sau=sau,
+        http=http,
+        identities=identities,
+    )
+    log.info(
+        "worker.started",
+        extra={"concurrency": settings.worker_concurrency, "data_identities": identities is not None},
+    )
     try:
         await worker.run(stop)
     finally:
+        if dtk is not None:
+            await dtk.aclose()
         await sau.aclose()
         await http.aclose()
         await engine.dispose()

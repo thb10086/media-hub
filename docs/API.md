@@ -638,10 +638,13 @@ curl -s -X POST "$HUB/api/v1/douyin/parse" -H "X-API-Key: $KEY" -H "Content-Type
 
 **查询会话**：`GET /api/v1/accounts/login-sessions/{session_id}` · scope `accounts:manage`，返回结构同上。
 
+**取消会话**：`DELETE /api/v1/accounts/login-sessions/{session_id}` · scope `accounts:manage`。用户换新二维码、或同一个人又发起了新的绑定时，取消旧会话：服务端立刻关掉为它打开的浏览器、释放登录名额（每个会话都占一个，未扫码会等到超时，进入身份验证后更久），新会话就不用排队。会话变为 `expired`，`error.code` 为 `CANCELLED`；已结束的会话原样返回。取消后哪怕平台那边恰好登录成功，也不会登记账号。
+
 | status | 含义 | 前端表现 |
 |---|---|---|
 | `pending` | 正在启动浏览器并打开平台登录页（当前服务器实测约 40 秒） | 显示“正在生成二维码…” |
 | `qrcode_ready` | 二维码已就绪，`qrcode` 为图片（`data:image/...;base64,...` 或 https 地址），可直接放进 `<img src>` | 显示二维码，提示“请用抖音 App 扫码” |
+| `verification_required` | 扫码确认后，平台要求账号本人验证身份（新设备 / 异地登录常见）。`verification` 说明要什么，见下文 | 显示验证码输入框，提交到 `.../verification` |
 | `succeeded` | 扫码登录成功，`account` 为绑定的账号（含 `account_id`） | 显示“绑定成功”，保存 `account_id` |
 | `failed` | 失败，`error` 为 `{code, message}`；`UPSTREAM_UNAVAILABLE` 表示当前扫码登录的人较多，稍后重试 | 显示失败原因与“重试”按钮 |
 | `expired` | 超时未扫码（约 4.5 分钟） | 显示“二维码已过期”与“刷新”按钮 |
@@ -653,6 +656,33 @@ curl -s -X POST "$HUB/api/v1/douyin/parse" -H "X-API-Key: $KEY" -H "Content-Type
 - “刷新二维码”就是重新创建一个会话。
 - 同一台服务器同时进行的扫码登录数量有限（每个会话要启动一个浏览器），超出时会话会在 `pending` 排队。
 - 本服务部署在海外时，平台可能在用户手机上提示“异地登录”并要求验证，按提示完成即可；登录态失效后需要重新扫码绑定。
+- **抖音账号同时供给数据身份池**：抖音扫码成功后，服务端会把这次的登录态导入抖音数据服务的身份池（搜索、热榜、作品详情、下载都靠它签名），`account.data_identity` 说明结果，见 [4.2](#42-账号列表与删除)。导入失败不会让绑定失败，服务端会自动重试。
+
+#### 扫码后的身份验证（短信验证码）
+
+抖音对新设备、异地 IP 的扫码登录经常追加“身份验证”：网页上要求向账号绑定的手机发短信验证码。服务端的浏览器没人能操作，所以由服务端替用户选“接收短信验证码”，再把验证码的输入交给你们的前端：
+
+```json
+"status": "verification_required",
+"verification": {
+  "method": "sms",
+  "phone": "138****1234",
+  "screenshot": "data:image/jpeg;base64,...",
+  "error": "验证码没有通过，请核对后重新输入"
+}
+```
+
+| 字段 | 说明 |
+|---|---|
+| `method` | `sms`：验证码已发到 `phone`（平台给出的打码手机号，可能为空）；`sms_send`：平台要求用户用 `phone` 发一条短信，`message` 是平台的说明（发什么、发到哪个号码），截图里也有；`unsupported`：其他验证方式（如“请在 App 中确认”），`message` 是平台原话——用户在手机上按提示完成后，会话照样会变成 `succeeded` |
+| `screenshot` | 平台验证页的截图（JPEG data URL），可选展示，帮助用户确认 |
+| `error` | 平台明确拒绝了上一次的回应（页面上出现了错误提示），用户可重新输入 |
+| `notice` | 中性提示：验证码已重新发送、已提交但平台还在确认等 |
+| `submitted_at` | 已提交、等待平台结果 |
+
+**回应验证**：`POST /api/v1/accounts/login-sessions/{session_id}/verification` · scope `accounts:manage`，`sms` 时请求体 `{"code": "123456"}`（4–8 位数字），没收到验证码时 `{"resend": true}` 让平台重发；`sms_send` 时用户发完短信后提交 `{"sent": true}`（三者每次只能给一个），返回 `202` 与会话。之后继续轮询：平台接受后变为 `succeeded`；不接受时仍是 `verification_required` 且带 `error`。会话不在 `verification_required` 时返回 `409 CONFLICT`。进入验证后会话有效期会延长约 5 分钟，留出收短信、输入和重试的时间。
+
+验证码由用户本人在你们的界面里输入，服务端只负责转交到平台页面；SSE 流式登录会推送 `verification` 事件，但无法提交验证码，需要验证的场景请用登录会话接口。
 
 #### 备选：SSE 流式登录
 
@@ -678,6 +708,7 @@ data: {"account": {"account_id": "5a1e…", "platform": "douyin", "name": "品�
 | 事件 | 说明 |
 |---|---|
 | `qrcode` | 二维码图片地址（通常是 `data:image/...;base64,...`，可直接放进 `<img src>`）。可能推送多次（二维码刷新） |
+| `verification` | 平台要求身份验证（结构同上文 `verification`）；SSE 方式无法提交验证码 |
 | `success` | 扫码登录成功，返回账号信息，**保存 `account_id` 用于发布** |
 | `failed` | 失败或超时（约 4 分钟），`data` 为 `{"code": "...", "message": "..."}` |
 
@@ -685,10 +716,24 @@ data: {"account": {"account_id": "5a1e…", "platform": "douyin", "name": "品�
 
 ### 4.2 账号列表与删除
 
-- `GET /api/v1/accounts?platform=douyin`（`platform` 可选）· scope `accounts:manage`，返回 `{"items": [{account_id, platform, name, status, created_at}]}`。
-- `DELETE /api/v1/accounts/{account_id}` · scope `accounts:manage`，同时删除服务端保存的登录态。
+- `GET /api/v1/accounts?platform=douyin`（`platform` 可选）· scope `accounts:manage`，返回 `{"items": [{account_id, platform, name, status, created_at, data_identity}]}`。
+- `DELETE /api/v1/accounts/{account_id}` · scope `accounts:manage`，同时删除服务端保存的登录态，并把它在数据身份池里的身份退役（之后不再用这个账号取数据）。
 
 账号登录态会过期（平台策略，通常数天到数周），过期后发布会失败，需要重新扫码绑定。
+
+`data_identity`（仅抖音账号，其他平台为 `null`）：这个账号的登录态是否已导入抖音数据身份池。
+
+```json
+{"status": "active", "authenticated": true, "expires_at": "2026-11-30T00:00:00+00:00", "updated_at": "2026-10-02T03:00:00+00:00"}
+```
+
+| status | 含义 |
+|---|---|
+| `active` | 已导入：搜索、热榜、作品详情、下载可以用这个账号的登录态签名 |
+| `pending` | 还没导入（例如功能上线前绑定的账号），服务端会在几分钟内补上 |
+| `failed` | 导入失败，`error` 为原因（如 `missing ttwid`：登录态缺少网页端 Cookie，重新扫码即可），服务端按 30 分钟起递增的间隔重试 |
+
+`authenticated` 为 `true` 表示导入的是带登录会话的 Cookie；`expires_at` 是从 Cookie 推算的会话到期时间（可能为空）。身份池是本服务所有租户共用的：同一个登录态会被用于整个服务的数据请求。运维可通过 `HUB_DATA_IDENTITY_FROM_LOGINS=false` 关闭导入（已导入的身份仍会在删除账号时退役）。
 
 ### 4.3 上传素材
 

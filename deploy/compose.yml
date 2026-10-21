@@ -41,6 +41,11 @@ x-hub-app: &hub-app
   oom_score_adj: 500
   logging: *logging
 
+# SAU's browser logs in with this User-Agent and the gateway hands the same string to
+# DTK with every imported login: DTK picks its TLS profile from it, so the two must agree.
+# The default matches the Chromium of SAU's Playwright (deploy/sau/Dockerfile); change both together.
+x-douyin-user-agent: &douyin-user-agent "${HUB_DOUYIN_USER_AGENT:-Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36}"
+
 x-hub-environment: &hub-environment
   HUB_DATABASE_URL: postgresql+asyncpg://hub:${HUB_POSTGRES_PASSWORD:?set HUB_POSTGRES_PASSWORD in deploy/.env}@hub-postgres:5432/hub
   HUB_REDIS_URL: redis://:${HUB_REDIS_PASSWORD:?set HUB_REDIS_PASSWORD in deploy/.env}@hub-redis:6379/0
@@ -49,6 +54,7 @@ x-hub-environment: &hub-environment
   HUB_MEDIA_DIR: /data/media
   HUB_SAU_BASE_URL: http://sau:5409
   HUB_SAU_VIDEO_DIR: /data/sau-videos
+  HUB_DOUYIN_USER_AGENT: *douyin-user-agent
 
 services:
   hub-postgres:
@@ -172,6 +178,8 @@ services:
     networks:
       - hub-data
       - hub-edge
+      # Reaches dtk-api to import bound Douyin accounts into its identity pool.
+      - shared
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -199,6 +207,7 @@ services:
       # Scheduled publish times are computed in local time and typed into the
       # platform's form as Beijing time. A POSIX TZ string needs no tzdata.
       TZ: ${HUB_PUBLISH_TZ:-CST-8}
+      SAU_USER_AGENT: *douyin-user-agent
     volumes:
       - sau-db:/app/db
       - sau-cookies:/app/cookiesFile

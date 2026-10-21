@@ -1139,7 +1139,109 @@
         ]
       }
     },
+    "/api/v1/accounts/login-sessions/{session_id}/verification": {
+      "post": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "回应扫码后平台的身份验证：短信验证码，或“已发送短信”（会话状态为 verification_required 时）",
+        "description": "Pass the owner's answer to the login waiting for it.\n\n``{\"code\": \"123456\"}`` when the platform sent a code (``verification.method`` is\n``sms``), ``{\"resend\": true}`` when it never arrived; ``{\"sent\": true}`` once the\nowner sent the SMS it asked for (``sms_send``).\n\nThe outcome arrives on the session like every other step: ``succeeded`` once\nthe platform accepts the code, or ``verification_required`` again with\n``verification.error`` set when it does not.",
+        "operationId": "submit_login_verification_api_v1_accounts_login_sessions__session_id__verification_post",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "title": "Session Id"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LoginVerificationSubmit"
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "参数校验失败（INVALID_PARAM）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/accounts/login-sessions/{session_id}": {
+      "delete": {
+        "tags": [
+          "accounts"
+        ],
+        "summary": "取消扫码登录会话（换新二维码时取消旧的，立即释放服务端浏览器）",
+        "description": "End a login nobody will finish. Each one holds a headless browser and one of the few\nlogin slots until it times out (minutes, more with an identity check), so a newer login\nfor the same person would otherwise queue behind it. Finished sessions are returned as is.",
+        "operationId": "cancel_login_session_api_v1_accounts_login_sessions__session_id__delete",
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "title": "Session Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "400": {
+            "description": "参数校验失败（INVALID_PARAM）",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                }
+              }
+            }
+          }
+        }
+      },
       "get": {
         "tags": [
           "accounts"
@@ -1963,6 +2065,39 @@
           "name"
         ],
         "title": "LoginSessionCreate"
+      },
+      "LoginVerificationSubmit": {
+        "properties": {
+          "code": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^\\d{4,8}$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Code",
+            "description": "method 为 sms 时：平台发到账号手机上的短信验证码"
+          },
+          "sent": {
+            "type": "boolean",
+            "title": "Sent",
+            "description": "method 为 sms_send 时：用户已按平台要求发出短信",
+            "default": false
+          },
+          "resend": {
+            "type": "boolean",
+            "title": "Resend",
+            "description": "method 为 sms 时：没收到验证码，请平台重新发送",
+            "default": false
+          }
+        },
+        "additionalProperties": false,
+        "type": "object",
+        "title": "LoginVerificationSubmit",
+        "description": "The owner's answer to the platform's identity check: the SMS code, or that they sent the SMS."
       },
       "ParseRequest": {
         "properties": {

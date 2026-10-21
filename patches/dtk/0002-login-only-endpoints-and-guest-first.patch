@@ -1,0 +1,206 @@
+diff --git a/src/dtk/identity/pool.py b/src/dtk/identity/pool.py
+index 7b2e1b1..7eaecc1 100644
+--- a/src/dtk/identity/pool.py
++++ b/src/dtk/identity/pool.py
+@@ -311,6 +311,7 @@ class IdentityPool:
+                         window_risk,
+                         row.consecutive_fails,
+                     ),
++                    authenticated=bool(row.authenticated),
+                 )
+             )
+         return candidates
+diff --git a/src/dtk/scheduler/scheduler.py b/src/dtk/scheduler/scheduler.py
+index 3eb8a97..3ac92ff 100644
+--- a/src/dtk/scheduler/scheduler.py
++++ b/src/dtk/scheduler/scheduler.py
+@@ -29,6 +29,12 @@ if TYPE_CHECKING:  # pragma: no cover - imported for typing only
+ log = get_logger(__name__)
+ 
+ 
++#: media-hub patch: endpoints Douyin only answers for a logged-in session. A guest
++#: identity gets an empty 200 there, which reads as "no results" rather than as the
++#: refusal it is, so these are served by logged-in identities only.
++LOGIN_ONLY_ENDPOINTS: frozenset[str] = frozenset({"douyin.search"})
++
++
+ @dataclass(frozen=True, slots=True)
+ class Candidate:
+     """The scheduling view of an identity: just enough to rank it."""
+@@ -39,6 +45,8 @@ class Candidate:
+     #: Epoch seconds; None means never used, which sorts first under LRU.
+     last_used_at: float | None
+     health: HealthInput
++    #: media-hub patch: whether the jar carries a logged-in session.
++    authenticated: bool = False
+ 
+ 
+ class CandidateSource(Protocol):
+@@ -124,6 +132,10 @@ class Scheduler:
+ 
+     # -- selection ---------------------------------------------------------
+ 
++    @staticmethod
++    def _usable(candidates: Sequence[Candidate], login_only: bool) -> list[Candidate]:
++        return [c for c in candidates if c.authenticated] if login_only else list(candidates)
++
+     def _rank(
+         self,
+         candidates: Sequence[Candidate],
+@@ -222,18 +234,37 @@ class Scheduler:
+                 )
+             pool = [pinned]
+         else:
+-            pool = list(await self._source.candidates(platform, IdentityState.ACTIVE))
++            login_only = endpoint in LOGIN_ONLY_ENDPOINTS
++            pool = self._usable(
++                await self._source.candidates(platform, IdentityState.ACTIVE), login_only
++            )
+             if not pool:
+                 # Degraded identities are the last resort, used only once the
+                 # healthy pool is empty.
+-                pool = list(await self._source.candidates(platform, IdentityState.DEGRADED))
++                pool = self._usable(
++                    await self._source.candidates(platform, IdentityState.DEGRADED), login_only
++                )
++            if not pool and login_only:
++                # Not waitable: no amount of polling logs anyone in.
++                raise Rejected(
++                    RejectReason.NO_IDENTITY,
++                    "no logged-in identity for this endpoint",
++                    waitable=False,
++                )
+             if not pool:
+                 raise Rejected(RejectReason.NO_IDENTITY, "no active or degraded identity")
+ 
+         recent = await last_used_map()
+         saw_inflight = False
+         saw_no_token = False
+-        for candidate in self._rank(pool, seed, recent):
++        ranked = self._rank(pool, seed, recent)
++        if identity_id is None:
++            # media-hub patch: public endpoints try guest identities first and borrow a
++            # logged-in one only when every guest is busy or out of quota, so the
++            # sessions merchants lend the pool are spent on what only they can do.
++            guests = [c for c in ranked if not c.authenticated]
++            ranked = guests + [c for c in ranked if c.authenticated]
++        for candidate in ranked:
+             lease, why = await try_acquire(
+                 candidate.identity_id,
+                 endpoint,
+diff --git a/tests/integration/test_scheduler_login_only.py b/tests/integration/test_scheduler_login_only.py
+new file mode 100644
+index 0000000..ac662ee
+--- /dev/null
++++ b/tests/integration/test_scheduler_login_only.py
+@@ -0,0 +1,110 @@
++"""media-hub patch: logged-in work goes to logged-in identities, the rest to guests first.
++
++Douyin answers a guest's search with an empty 200, which reads as "no results"
++rather than as the refusal it is. With guests and logged-in identities in one
++pool, search would otherwise succeed or come back empty depending on which
++identity the ranking picked.
++"""
++
++from __future__ import annotations
++
++import asyncio
++
++import pytest
++
++from dtk.core.errors import IdentityPoolExhausted
++from dtk.core.types import IdentityState, Outcome, Platform
++from dtk.scheduler.health import HealthInput
++from dtk.scheduler.scheduler import Candidate, Scheduler, SchedulerConfig
++
++pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
++
++NOW = 1_700_000_000.0
++SEARCH = "douyin.search"
++DETAIL = "douyin.content_detail"
++
++
++class FrozenClock:
++    def __call__(self) -> float:
++        return NOW
++
++
++class ListSource:
++    def __init__(self, candidates):
++        self._candidates = candidates
++
++    async def candidates(self, platform, state):
++        return [c for c in self._candidates if c.platform == platform and c.state == state]
++
++
++def candidate(name, *, authenticated, state=IdentityState.ACTIVE, last_used=None):
++    return Candidate(
++        identity_id=name,
++        platform=Platform.DOUYIN,
++        state=state,
++        last_used_at=last_used,
++        health=HealthInput(20, 20, 60, 0, 0),
++        authenticated=authenticated,
++    )
++
++
++def scheduler(pool, *, wait=5.0):
++    return Scheduler(
++        ListSource(pool),
++        SchedulerConfig(max_wait_seconds=wait, poll_interval_seconds=0.01, inflight_ttl_seconds=60),
++        clock=FrozenClock(),
++    )
++
++
++async def test_search_never_goes_to_a_guest(redis_client):
++    # The guest is the least recently used, so plain ranking would pick it.
++    pool = [
++        candidate("guest", authenticated=False, last_used=NOW - 1000),
++        candidate("merchant", authenticated=True, last_used=NOW - 1),
++    ]
++    sched = scheduler(pool)
++    for _ in range(3):
++        lease = await sched.acquire(SEARCH, Platform.DOUYIN)
++        assert lease.identity_id == "merchant"
++        await sched.release(lease, Outcome.OK)
++
++
++async def test_search_without_a_logged_in_identity_fails_at_once(redis_client):
++    sched = scheduler([candidate("guest", authenticated=False)], wait=30.0)
++    loop = asyncio.get_running_loop()
++    started = loop.time()
++    with pytest.raises(IdentityPoolExhausted) as exc:
++        await sched.acquire(SEARCH, Platform.DOUYIN)
++    assert loop.time() - started < 2.0
++    assert exc.value.details["reject_reason"] == "no_identity"
++
++
++async def test_a_degraded_logged_in_identity_still_serves_search(redis_client):
++    pool = [
++        candidate("guest", authenticated=False),
++        candidate("merchant", authenticated=True, state=IdentityState.DEGRADED),
++    ]
++    lease = await scheduler(pool).acquire(SEARCH, Platform.DOUYIN)
++    assert lease.identity_id == "merchant"
++
++
++async def test_public_endpoints_spend_guests_before_merchants(redis_client):
++    # The merchant is the least recently used, so plain ranking would pick it.
++    pool = [
++        candidate("merchant", authenticated=True, last_used=NOW - 1000),
++        candidate("guest", authenticated=False, last_used=NOW - 1),
++    ]
++    sched = scheduler(pool)
++    first = await sched.acquire(DETAIL, Platform.DOUYIN)
++    assert first.identity_id == "guest"
++    # While the guest is busy (one request per identity), the merchant is borrowed.
++    second = await sched.acquire(DETAIL, Platform.DOUYIN)
++    assert second.identity_id == "merchant"
++    await sched.release(first, Outcome.OK)
++    await sched.release(second, Outcome.OK)
++
++
++async def test_a_pinned_request_ignores_the_split(redis_client):
++    pool = [candidate("guest", authenticated=False), candidate("merchant", authenticated=True)]
++    lease = await scheduler(pool).acquire(DETAIL, Platform.DOUYIN, identity_id="merchant")
++    assert lease.identity_id == "merchant"

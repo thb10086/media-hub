@@ -75,11 +75,15 @@ cli.py        init-db / create-tenant / create-key / bootstrap / export-openapi
 - 已签发广州实例的 `saas-main` Key（服务器 `deploy/tenant-saas-main.json`，未绑定 IP 白名单）。
 - 已验证：所有容器健康、`/readyz`、租户鉴权和 `/api/v1/platforms`；外部访问仍需放行云安全组 TCP 18090。
 - 广州实例目前是新数据卷；美国旧实例的 DTK Cookie 身份池和业务数据库尚未迁入。
+- 身份池（2026-10-02 起）：扫码绑定的抖音账号自动导入 DTK（`services/data_identities.py`，表 `account_data_identities`，worker 每 5 分钟补导入/重试/完成退役）；
+  `deploy.sh guest-identity` 放入游客身份（热榜、详情、下载可用，搜索要登录态）。网关的 DTK Key 需要 `identity:manage`。
+- SSH：`ssh media-hub-gz`（ubuntu@118.89.27.233，免密 sudo、docker 组；本机密钥 `~/.ssh/id_ed25519_mediahub`）。服务器上的 `/opt/media-hub` 不是 git 仓库，部署 = 同步文件 + `deploy/deploy.sh up`。
+- 2026-10-02 抖音扫码后的短信验证：弹窗里的“验证”是带样式的 `<div>`（不是 button），之前只按 button 角色找，验证码填好了却没人点，登录一直停在“还在确认”。`deploy/sau/patch-login.py` 的 `_submit_button` 改为先找按钮、再找整段文字等于标签且在最上层的元素，都没有时在验证码框按回车；已在同一 SAU 镜像的临时容器里用模拟弹窗验证（只点到弹窗里的“验证”，背景表单不受影响），并只重建了 `sau` 服务（回滚镜像标签 `media-hub-sau:before-verify-fix-20261002`）。
 - 旧美国服务器 `43.162.114.123` 保留作迁移源；SSH 链路偶发握手超时，重试时使用 `-o IPQoS=none -o ConnectTimeout=60`。
 
 ## 待办
 
-1. 在 DTK 控制台导入抖音 Cookie 身份后，实测搜索/热榜/评论/下载；用测试账号实测抖音、视频号发布。
+1. 用真实抖音账号扫码，确认登录态导入身份池后搜索可用；用测试账号实测抖音、视频号发布。
 2. 服务器在美国：抖音/微信可能判定异地登录、数据接口风控更严；生产建议为 DTK 身份配置国内代理，或把 DTK+SAU 迁到国内节点。
 3. 视频号商业数据供应商选型与 Provider 实现（接口已固定：`providers/channels.py`）；自己作品的评论/数据。
 4. 素材改对象存储（OSS/COS/S3）；DTK 下载文件的过期清理策略。

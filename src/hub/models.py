@@ -14,6 +14,7 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     BigInteger,
+    Boolean,
     Date,
     DateTime,
     ForeignKey,
@@ -25,7 +26,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-from hub.constants import AccountStatus, KeyStatus, TaskStatus, TenantStatus
+from hub.constants import AccountStatus, DataIdentityStatus, KeyStatus, TaskStatus, TenantStatus
 
 JsonType = JSON().with_variant(JSONB(), "postgresql")
 ID_LENGTH = 36
@@ -92,6 +93,30 @@ class PlatformAccount(Base):
     sau_cookie_file: Mapped[str] = mapped_column(String(255))
     status: Mapped[str] = mapped_column(String(16), default=AccountStatus.ACTIVE.value)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AccountDataIdentity(Base):
+    """The DTK identity imported from a Douyin account's login.
+
+    A table of its own rather than columns on ``platform_accounts``: the schema
+    is created with ``create_all``, which adds missing tables but never alters
+    existing ones. No foreign key on purpose - a ``retiring`` row outlives the
+    account it came from until DTK confirms the identity is gone.
+    """
+
+    __tablename__ = "account_data_identities"
+    __table_args__ = (Index("account_data_identities_due_idx", "status", "next_attempt_at"),)
+
+    account_id: Mapped[str] = mapped_column(String(ID_LENGTH), primary_key=True)
+    tenant_id: Mapped[str] = mapped_column(String(ID_LENGTH), index=True)
+    status: Mapped[str] = mapped_column(String(16), default=DataIdentityStatus.PENDING.value)
+    identity_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    authenticated: Mapped[bool] = mapped_column(Boolean, default=False)
+    session_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class MediaFile(Base):

@@ -26,7 +26,10 @@ class SauPath:
     POST_VIDEO: Final = "/postVideo"
     ACCOUNTS: Final = "/getAccounts"
     DELETE_ACCOUNT: Final = "/deleteAccount"
+    DOWNLOAD_COOKIE: Final = "/downloadCookie"
     LOGIN: Final = "/login"
+    LOGIN_INPUT: Final = "/loginInput"
+    LOGIN_CANCEL: Final = "/loginCancel"
 
 
 SAU_OK: Final = 200
@@ -34,6 +37,10 @@ SSE_DATA_PREFIX: Final = "data:"
 LOGIN_SUCCEEDED: Final = "200"
 LOGIN_FAILED: Final = "500"
 LOGIN_TERMINAL: Final = frozenset({LOGIN_SUCCEEDED, LOGIN_FAILED})
+#: The platform asked the account owner to prove it is them; JSON follows the prefix.
+LOGIN_VERIFY_PREFIX: Final = "verify:"
+#: Sent while waiting on the owner, so the stream's read timeout does not fire.
+LOGIN_KEEPALIVE: Final = "ping"
 ACCOUNT_ROW_FIELDS: Final = 5
 DEFAULT_VIDEO_TYPE: Final = "video/mp4"
 VIDEOS_PER_DAY: Final = 1
@@ -104,9 +111,9 @@ class SauClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+    async def _send(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         try:
-            response = await self._client.request(method, path, **kwargs)
+            return await self._client.request(method, path, **kwargs)
         except httpx.TimeoutException as exc:
             raise HubError(
                 ErrorCode.UPSTREAM_TIMEOUT, "the publishing service did not answer in time"
@@ -117,6 +124,9 @@ class SauClient:
                 "the publishing service is unreachable",
                 details={"reason": type(exc).__name__},
             ) from exc
+
+    async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
+        response = await self._send(method, path, **kwargs)
         try:
             body = response.json()
         except ValueError:
@@ -158,6 +168,31 @@ class SauClient:
     async def delete_account(self, sau_account_id: int) -> None:
         await self._request("GET", SauPath.DELETE_ACCOUNT, params={"id": sau_account_id})
 
+    async def cookie_jar(self, cookie_file: str) -> dict[str, Any]:
+        """The Playwright storage state SAU saved for an account: ``{"cookies": [...], "origins": [...]}``.
+
+        ``/downloadCookie`` answers with the file itself on success and with SAU's
+        JSON envelope only on failure, so it does not go through ``_request``.
+        """
+        response = await self._send("GET", SauPath.DOWNLOAD_COOKIE, params={"filePath": cookie_file})
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if response.status_code != httpx.codes.OK or not isinstance(body, dict):
+            raise HubError(
+                ErrorCode.UPSTREAM_ERROR,
+                "the publishing service has no saved login for this account",
+                details={"status": response.status_code},
+            )
+        if not isinstance(body.get("cookies"), list):
+            raise HubError(
+                ErrorCode.UPSTREAM_ERROR,
+                str(body.get("msg") or "the saved login is not a browser storage state"),
+                details={"status": response.status_code},
+            )
+        return body
+
     async def stage_video(self, source: Path) -> str:
         """Hand a video to SAU and return the file name ``/postVideo`` expects."""
         name = f"{uuid.uuid4().hex}{source.suffix.lower()}"
@@ -181,8 +216,29 @@ class SauClient:
     async def post_video(self, spec: PostVideoSpec) -> None:
         await self._request("POST", SauPath.POST_VIDEO, json=spec.payload(), timeout=self._publish_timeout)
 
+    async def submit_login_input(
+        self, user_name: str, code: str | None = None, *, sent: bool = False, resend: bool = False
+    ) -> None:
+        """Hand the owner's answer to the login that asked: the SMS code, "sent" or "resend"."""
+        answer: dict[str, str] = {"id": user_name}
+        if sent:
+            answer["action"] = "sent"
+        elif resend:
+            answer["action"] = "resend"
+        else:
+            answer["code"] = code or ""
+        await self._request("POST", SauPath.LOGIN_INPUT, json=answer)
+
+    async def cancel_login(self, user_name: str) -> None:
+        """Stop a login nobody will finish: SAU closes its browser instead of waiting minutes."""
+        await self._request("POST", SauPath.LOGIN_CANCEL, json={"id": user_name})
+
     async def login_events(self, platform_type: int, user_name: str) -> AsyncIterator[str]:
-        """The raw SSE payloads of one QR login: the QR image, then ``200`` or ``500``."""
+        """The raw SSE payloads of one QR login.
+
+        QR images (repeatable), ``verify:{json}`` when the platform wants an
+        identity check, ``ping`` keepalives, then ``200`` or ``500``.
+        """
         timeout = httpx.Timeout(self._login_timeout, connect=self._request_timeout)
         try:
             async with self._client.stream(

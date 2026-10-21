@@ -8,7 +8,7 @@ from functools import lru_cache
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from hub.constants import SAU_PLATFORM_TYPES, Platform
+from hub.constants import DEFAULT_DOUYIN_USER_AGENT, SAU_PLATFORM_TYPES, Platform
 from hub.services.ranking import HeatWeights
 
 BYTES_PER_MB = 1024 * 1024
@@ -68,6 +68,21 @@ class Settings(BaseSettings):
     login_max_concurrency: int = Field(default=1, ge=1)
     #: How long a finished login session can still be read.
     login_session_retention_seconds: float = Field(default=600.0, gt=0)
+
+    #: Import the login of every Douyin account bound by QR code into DTK's
+    #: identity pool, so search, the hot board and downloads have an identity as
+    #: soon as anyone has bound an account. Needs a DTK key with ``identity:manage``.
+    #: Off: nothing new is imported, but removed accounts are still retired in DTK.
+    data_identity_from_logins: bool = True
+    #: The User-Agent SAU's browser logs in with; deploy/compose.yml hands the same
+    #: value to SAU as SAU_USER_AGENT. DTK picks its TLS profile from it.
+    douyin_user_agent: str = DEFAULT_DOUYIN_USER_AGENT
+    douyin_language: str = "zh-CN"
+    douyin_timezone: str = "Asia/Shanghai"
+    #: How often the worker imports accounts still missing an identity.
+    data_identity_sync_seconds: float = Field(default=300.0, gt=0)
+    #: Wait after a failed import, growing with each failure (up to six times).
+    data_identity_retry_seconds: float = Field(default=1800.0, gt=0)
 
     channels_provider: ChannelsProviderName = ChannelsProviderName.NONE
 

@@ -107,16 +107,44 @@ class AccountStatus(str, Enum):
     INVALID = "invalid"
 
 
+class DataIdentityStatus(str, Enum):
+    """Whether a Douyin account's login also stocks DTK's identity pool.
+
+    ``pending`` (not imported yet) -> ``active`` (DTK may sign data requests with
+    it) or ``failed`` (retried by the worker). ``retiring`` outlives its account:
+    the account is gone but DTK has not confirmed the identity is retired yet.
+    """
+
+    PENDING = "pending"
+    ACTIVE = "active"
+    FAILED = "failed"
+    RETIRING = "retiring"
+
+
+#: The User-Agent SAU's browser logs in with in the container (SAU_USER_AGENT).
+#: DTK chooses its TLS profile from it, so the imported jar and the browser that
+#: produced it must agree; change both together with SAU's Playwright version.
+DEFAULT_DOUYIN_USER_AGENT: Final = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+)
+
+
 class WebhookEvent(str, Enum):
     TASK_SUCCEEDED = "task.succeeded"
     TASK_FAILED = "task.failed"
 
 
 class LoginSessionStatus(str, Enum):
-    """A polled QR login: ``pending`` -> ``qrcode_ready`` -> ``succeeded`` / ``failed`` / ``expired``."""
+    """A polled QR login: ``pending`` -> ``qrcode_ready`` -> ``succeeded`` / ``failed`` / ``expired``.
+
+    ``verification_required`` sits between the scan and success when the platform
+    asks the account owner to prove it is them (an SMS code), which is answered
+    through ``POST /accounts/login-sessions/{id}/verification``.
+    """
 
     PENDING = "pending"
     QRCODE_READY = "qrcode_ready"
+    VERIFICATION_REQUIRED = "verification_required"
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     EXPIRED = "expired"

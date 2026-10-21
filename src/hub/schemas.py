@@ -59,6 +59,24 @@ class LoginSessionCreate(BaseModel):
     name: str = Field(min_length=1, max_length=64)
 
 
+class LoginVerificationSubmit(BaseModel):
+    """The owner's answer to the platform's identity check: the SMS code, or that they sent the SMS."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    code: str | None = Field(
+        default=None, pattern=r"^\d{4,8}$", description="method 为 sms 时：平台发到账号手机上的短信验证码"
+    )
+    sent: bool = Field(default=False, description="method 为 sms_send 时：用户已按平台要求发出短信")
+    resend: bool = Field(default=False, description="method 为 sms 时：没收到验证码，请平台重新发送")
+
+    @model_validator(mode="after")
+    def _one_answer(self) -> LoginVerificationSubmit:
+        if [self.code is not None, self.sent, self.resend].count(True) != 1:
+            raise ValueError("send exactly one of code, sent=true or resend=true")
+        return self
+
+
 class DownloadRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 

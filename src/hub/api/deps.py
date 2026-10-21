@@ -19,6 +19,7 @@ from hub.providers.sau import SauClient
 from hub.security.auth import Principal, authenticate, presented_key
 from hub.security.net import client_ip
 from hub.services.cache import ResponseCache
+from hub.services.data_identities import DataIdentities
 from hub.services.login_sessions import LoginSessionStore
 from hub.settings import Settings
 
@@ -116,3 +117,8 @@ def get_cache(request: Request) -> ResponseCache:
 
 def get_http(request: Request) -> httpx.AsyncClient:
     return request.app.state.http
+
+
+def get_identities(request: Request) -> DataIdentities | None:
+    """Imports Douyin logins into DTK's identity pool; ``None`` without DTK or SAU."""
+    return request.app.state.identities

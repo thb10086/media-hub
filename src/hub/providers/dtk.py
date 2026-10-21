@@ -31,6 +31,8 @@ class DtkPath:
     DOWNLOADS: Final = "/api/v1/downloads"
     DOWNLOAD: Final = "/api/v1/downloads/{download_id}"
     DOWNLOAD_FILE: Final = "/api/v1/downloads/{download_id}/files/{name}"
+    IDENTITY_IMPORT: Final = "/api/v1/admin/identities/import"
+    IDENTITY: Final = "/api/v1/admin/identities/{identity_id}"
 
 
 HEADER_KEY: Final = "X-API-Key"
@@ -70,7 +72,10 @@ def map_upstream_error(error: Mapping[str, Any], *, missing_route_is_unconfigure
         return HubError(ErrorCode.UPSTREAM_UNAVAILABLE, message, details=details, retry_after=retry_after)
     if code in _BAD_INPUT:
         return HubError(ErrorCode.INVALID_PARAM, message, details=details)
-    if code == UPSTREAM_NOT_FOUND and missing_route_is_unconfigured:
+    # DTK answers a route it does not have with a bare NOT_FOUND. A task that ran and
+    # found nothing (e.g. a search Douyin answered empty) names its endpoint.
+    ran = isinstance(error.get("details"), Mapping) and "endpoint" in error["details"]
+    if code == UPSTREAM_NOT_FOUND and missing_route_is_unconfigured and not ran:
         return HubError(
             ErrorCode.NOT_CONFIGURED,
             "the data service does not provide this endpoint; apply patches/dtk to it",
@@ -303,6 +308,39 @@ class DtkClient:
     async def download(self, download_id: str) -> dict[str, Any]:
         _, data, _ = await self._send("GET", DtkPath.DOWNLOAD.format(download_id=quote(download_id, safe="")))
         return data if isinstance(data, dict) else {}
+
+    async def import_identity(
+        self,
+        *,
+        cookies: str,
+        user_agent: str,
+        language: str | None = None,
+        timezone: str | None = None,
+    ) -> dict[str, Any]:
+        """Store a Douyin cookie jar in DTK's identity pool; needs the ``identity:manage`` scope.
+
+        Returns DTK's answer: ``identity_id`` plus the import ``report``
+        (``authenticated``, ``expires_at``, ...). A jar DTK cannot use comes back
+        as ``INVALID_PARAM`` with ``missing_required`` in the upstream details.
+        """
+        body = {
+            "platform": PLATFORM_DOUYIN,
+            "cookies": cookies,
+            "user_agent": user_agent,
+            "language": language,
+            "timezone": timezone,
+        }
+        payload = {key: value for key, value in body.items() if value is not None}
+        _, data, _ = await self._send("POST", DtkPath.IDENTITY_IMPORT, json=payload)
+        return data if isinstance(data, dict) else {}
+
+    async def retire_identity(self, identity_id: str, *, reason: str) -> None:
+        """Retire an identity and wipe its cookies in DTK. Retiring a retired one is a no-op there."""
+        await self._send(
+            "DELETE",
+            DtkPath.IDENTITY.format(identity_id=quote(identity_id, safe="")),
+            json={"reason": reason},
+        )
 
     async def open_file(self, download_id: str, name: str) -> httpx.Response:
         """A streaming response for one stored file. The caller must close it."""

@@ -50,6 +50,14 @@ def test_missing_route_means_not_configured_only_when_asked():
     )
 
 
+def test_a_task_that_found_nothing_is_not_a_missing_route():
+    """A search Douyin answered empty comes back NOT_FOUND naming its endpoint: no content, not no patch."""
+    error = map_upstream_error(
+        {"code": "NOT_FOUND", "details": {"endpoint": "douyin.search"}}, missing_route_is_unconfigured=True
+    )
+    assert error.code is ErrorCode.CONTENT_UNAVAILABLE
+
+
 async def test_result_within_wait_window_is_done(router, dtk):
     route = router.get(f"{DTK_URL}/api/v1/douyin/video").respond(
         200, json=envelope({"content_id": "1"}, meta={"cached": True, "task_id": "t", "cursor": None})
