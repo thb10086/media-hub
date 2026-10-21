@@ -774,7 +774,9 @@ curl -s -X POST "$HUB/api/v1/media" -H "X-API-Key: $KEY" -F "file=@/path/to/vide
 | `account_id` | 是 | 扫码绑定得到的账号 ID，必须与 `platform` 一致 |
 | `media_id` | 二选一 | 已上传素材的 ID |
 | `video_url` | 二选一 | 公网可下载的视频地址（服务端会先下载） |
-| `title` | 是 | 标题 / 文案，1–1000 字。抖音作品标题建议不超过 30 字；视频号会自动生成符合要求的短标题 |
+| `title` | 是 | 标题 / 文案，1–1000 字。抖音只把前 30 字填进“作品标题”；视频号会自动生成符合要求的短标题 |
+| `description` | 否 | 正文，最多 1000 字。抖音填进“作品描述”，排在话题前面；其他平台忽略 |
+| `cover_url` | 否 | 竖版封面图（JPG / PNG / WEBP，≤ 10MB）的公网地址，仅抖音。worker 先下载再交给上传器；下载不了或封面设不上时跳过，照常发布（用平台推荐的封面），结果里 `cover=false` |
 | `tags` | 否 | 话题列表（不带 `#`），最多 20 个 |
 | `schedule` | 否 | 定时发布，见下 |
 | `draft` | 否 | 仅视频号：`true` 保存为草稿而不发布 |
@@ -804,12 +806,12 @@ curl -s -X POST "$HUB/api/v1/publish/videos" -H "X-API-Key: $KEY" \
 | HTTP / error.code | 原因 |
 |---|---|
 | 404 `NOT_FOUND` | `account_id` 或 `media_id` 不存在，或不属于当前租户 |
-| 400 `INVALID_PARAM` | 账号与 `platform` 不一致；账号需要重新登录；`media_id` 与 `video_url` 同时传或都没传；`draft` 用于非视频号；`video_url` / `callback_url` 不是公网地址 |
+| 400 `INVALID_PARAM` | 账号与 `platform` 不一致；账号需要重新登录；`media_id` 与 `video_url` 同时传或都没传；`draft` 用于非视频号；`video_url` / `cover_url` / `callback_url` 不是公网地址 |
 | 409 `CONFLICT` | `Idempotency-Key` 已用于内容不同的请求 |
 
 **执行结果**：`GET /api/v1/tasks/{task_id}`
 
-- 成功：`status=succeeded`，`result` 为 `{"platform", "account_id", "scheduled", "draft"}`。
+- 成功：`status=succeeded`，`result` 为 `{"platform", "account_id", "scheduled", "draft", "cover"}`（`cover` 表示带上了 `cover_url` 的封面）。
 - 失败：`status=failed`，常见 `error.code`：
 
 | error.code | 原因 | 处理 |

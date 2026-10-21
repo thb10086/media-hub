@@ -38,6 +38,11 @@ class PublishVideoRequest(BaseModel):
     media_id: str | None = Field(default=None, max_length=64)
     video_url: str | None = Field(default=None, max_length=MAX_URL_LENGTH)
     title: str = Field(min_length=1, max_length=1000)
+    #: The post's body text (Douyin's 作品描述, before the tags). Platforms without one ignore it.
+    description: str | None = Field(default=None, max_length=1000)
+    #: A portrait cover image (JPG/PNG/WEBP) the worker downloads; Douyin only. A cover that cannot be
+    #: fetched or set is skipped and the video is published with the platform's own cover.
+    cover_url: str | None = Field(default=None, max_length=MAX_URL_LENGTH)
     tags: list[str] = Field(default_factory=list, max_length=20)
     schedule: PublishSchedule | None = None
     draft: bool = False

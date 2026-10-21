@@ -4,6 +4,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 
 from conftest import SAU_URL, add_account
@@ -100,6 +101,7 @@ async def test_publish_runs_in_worker_and_signs_the_callback(app, client, tenant
         "account_id": account_id,
         "scheduled": False,
         "draft": False,
+        "cover": False,
     }
 
     sent = json.loads(post_route.calls.last.request.content)
@@ -255,3 +257,72 @@ async def test_shared_directory_staging_copies_and_discards(tmp_path):
         assert not (shared / name).exists()
     finally:
         await client.aclose()
+
+
+COVER_BYTES = b"\xff\xd8\xff\xe0fake-jpeg"
+
+
+async def test_body_text_and_cover_reach_the_douyin_uploader(app, client, tenant, upstream, settings):
+    account_id = await add_account(app, tenant.tenant_id)
+    upstream.get("http://cdn.test/v/clip.mp4").respond(200, content=VIDEO_BYTES)
+    upstream.get("http://cdn.test/c/cover.jpg").respond(200, content=COVER_BYTES)
+    upload_route = upstream.post(f"{SAU_URL}/upload")
+    upload_route.side_effect = [
+        httpx.Response(200, json=sau_ok("staged.mp4")),
+        httpx.Response(200, json=sau_ok("cover.jpg")),
+    ]
+    post_route = upstream.post(f"{SAU_URL}/postVideo").respond(200, json=sau_ok())
+
+    body = publish_body(
+        account_id,
+        None,
+        video_url="http://cdn.test/v/clip.mp4",
+        description="店就在长河地铁 B 口，晚上九点前都有货。",
+        cover_url="http://cdn.test/c/cover.jpg",
+    )
+    accepted = await client.post("/api/v1/publish/videos", json=body, headers=tenant.headers)
+    assert accepted.status_code == 202
+    await worker_for(app).run_once()
+
+    staged_cover = upload_route.calls[1].request
+    assert COVER_BYTES in staged_cover.content and b"image/jpeg" in staged_cover.content
+    sent = json.loads(post_route.calls.last.request.content)
+    assert sent["desc"] == "店就在长河地铁 B 口，晚上九点前都有货。"
+    assert sent["thumbnailPortrait"] == "cover.jpg"
+    task = (
+        await client.get(f"/api/v1/tasks/{accepted.json()['data']['task_id']}", headers=tenant.headers)
+    ).json()
+    assert task["data"]["result"]["cover"] is True
+    assert list((Path(settings.media_dir) / tenant.tenant_id).iterdir()) == [], "video and cover removed"
+
+
+async def test_a_cover_that_cannot_be_fetched_does_not_stop_the_post(app, client, tenant, upstream, settings):
+    account_id = await add_account(app, tenant.tenant_id)
+    upstream.get("http://cdn.test/v/clip.mp4").respond(200, content=VIDEO_BYTES)
+    upstream.get("http://cdn.test/c/gone.jpg").respond(404)
+    upstream.post(f"{SAU_URL}/upload").respond(200, json=sau_ok("staged.mp4"))
+    post_route = upstream.post(f"{SAU_URL}/postVideo").respond(200, json=sau_ok())
+
+    body = publish_body(
+        account_id, None, video_url="http://cdn.test/v/clip.mp4", cover_url="http://cdn.test/c/gone.jpg"
+    )
+    accepted = await client.post("/api/v1/publish/videos", json=body, headers=tenant.headers)
+    await worker_for(app).run_once()
+
+    sent = json.loads(post_route.calls.last.request.content)
+    assert (sent["thumbnailPortrait"], sent["desc"]) == ("", "")
+    task = (
+        await client.get(f"/api/v1/tasks/{accepted.json()['data']['task_id']}", headers=tenant.headers)
+    ).json()
+    assert task["data"]["status"] == "succeeded"
+    assert task["data"]["result"]["cover"] is False
+    assert list((Path(settings.media_dir) / tenant.tenant_id).iterdir()) == []
+
+
+async def test_a_cover_url_on_a_private_address_is_refused(client, tenant, prepared, settings):
+    media_id, account_id = prepared
+    settings.allow_private_urls = False
+    body = publish_body(account_id, media_id, cover_url="http://127.0.0.1/cover.jpg")
+    response = await client.post("/api/v1/publish/videos", json=body, headers=tenant.headers)
+    assert response.status_code == 400
+    assert response.json()["error"]["details"]["field"] == "cover_url"

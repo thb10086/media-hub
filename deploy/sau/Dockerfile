@@ -41,7 +41,7 @@ RUN cp conf.example.py conf.py \
  && chmod 1777 /app/videoFile
 
 COPY --chmod=0755 entrypoint.sh /usr/local/bin/sau-entrypoint
-COPY patch-login.py guest-jar.py /usr/local/share/sau-patches/
+COPY patch-login.py patch-publish.py guest-jar.py /usr/local/share/sau-patches/
 
 EXPOSE 5409
 ENTRYPOINT ["sau-entrypoint"]

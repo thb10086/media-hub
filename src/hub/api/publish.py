@@ -34,7 +34,11 @@ async def publish_video(
     await load_account(session, body, principal.tenant_id)
     if body.media_id is not None:
         await load_media(session, body.media_id, principal.tenant_id)
-    for field, url in (("video_url", body.video_url), ("callback_url", body.callback_url)):
+    for field, url in (
+        ("video_url", body.video_url),
+        ("cover_url", body.cover_url),
+        ("callback_url", body.callback_url),
+    ):
         if url is not None:
             await ensure_public_url(url, field=field, allow_private=settings.allow_private_urls)
     task, created = await create_task(

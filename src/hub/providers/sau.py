@@ -65,6 +65,9 @@ class PostVideoSpec:
     daily_times: tuple[int, ...] = ()
     start_days: int = 0
     draft: bool = False
+    #: Body text and a staged portrait cover: read by the patched Douyin route (deploy/sau/patch-publish.py).
+    description: str | None = None
+    cover_file: str = ""
 
     def payload(self) -> dict[str, Any]:
         scheduled = bool(self.daily_times)
@@ -81,6 +84,8 @@ class PostVideoSpec:
             "startDays": self.start_days,
             "isDraft": self.draft,
             "thumbnail": "",
+            "desc": self.description or "",
+            "thumbnailPortrait": self.cover_file,
             "productLink": "",
             "productTitle": "",
         }
@@ -193,8 +198,8 @@ class SauClient:
             )
         return body
 
-    async def stage_video(self, source: Path) -> str:
-        """Hand a video to SAU and return the file name ``/postVideo`` expects."""
+    async def stage_video(self, source: Path, content_type: str = DEFAULT_VIDEO_TYPE) -> str:
+        """Hand a file (the video, or its cover) to SAU and return the name ``/postVideo`` expects."""
         name = f"{uuid.uuid4().hex}{source.suffix.lower()}"
         if self._video_dir is not None:
             await asyncio.to_thread(shutil.copyfile, source, self._video_dir / name)
@@ -203,7 +208,7 @@ class SauClient:
             data = await self._request(
                 "POST",
                 SauPath.UPLOAD,
-                files={"file": (name, handle, DEFAULT_VIDEO_TYPE)},
+                files={"file": (name, handle, content_type)},
                 timeout=self._publish_timeout,
             )
         return str(data)

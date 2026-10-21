@@ -13,6 +13,10 @@ from fastapi import UploadFile
 from hub.errors import ErrorCode, HubError
 
 ALLOWED_VIDEO_SUFFIXES: Final = frozenset({".mp4", ".mov", ".m4v", ".webm"})
+#: Cover images the Douyin uploader accepts.
+ALLOWED_IMAGE_SUFFIXES: Final = frozenset({".jpg", ".jpeg", ".png", ".webp"})
+#: Covers are small; anything bigger is not one.
+MAX_COVER_BYTES: Final = 10 * 1024 * 1024
 CHUNK_BYTES: Final = 1024 * 1024
 PARTIAL_SUFFIX: Final = ".part"
 
@@ -63,7 +67,13 @@ async def save_upload(upload: UploadFile, destination: Path, *, max_bytes: int) 
 
 
 async def download_to(
-    client: httpx.AsyncClient, url: str, destination: Path, *, max_bytes: int, request_timeout: float
+    client: httpx.AsyncClient,
+    url: str,
+    destination: Path,
+    *,
+    max_bytes: int,
+    request_timeout: float,
+    field: str = "video_url",
 ) -> int:
     partial = destination.with_name(destination.name + PARTIAL_SUFFIX)
     written = 0
@@ -72,8 +82,8 @@ async def download_to(
             if not response.is_success:
                 raise HubError(
                     ErrorCode.INVALID_PARAM,
-                    "the video URL could not be fetched",
-                    details={"field": "video_url", "status": response.status_code},
+                    f"the {field} could not be fetched",
+                    details={"field": field, "status": response.status_code},
                 )
             declared = response.headers.get("Content-Length")
             if declared and declared.isdigit() and int(declared) > max_bytes:
@@ -88,8 +98,8 @@ async def download_to(
         partial.unlink(missing_ok=True)
         raise HubError(
             ErrorCode.INVALID_PARAM,
-            "the video URL could not be fetched",
-            details={"field": "video_url", "reason": type(exc).__name__},
+            f"the {field} could not be fetched",
+            details={"field": field, "reason": type(exc).__name__},
         ) from exc
     except BaseException:
         partial.unlink(missing_ok=True)

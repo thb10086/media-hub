@@ -54,7 +54,7 @@ cli.py        init-db / create-tenant / create-key / bootstrap / export-openapi
     `git -c core.autocrlf=false add -A`、`git -c core.autocrlf=false diff --cached --output=<仓库>/patches/dtk/0001-douyin-keyword-search-and-hot-board.patch`、`git reset -q`。
   - 跑 DTK 测试：`.upstream/dtk/.venv`，需要 `DTK_SECRET_KEY`（≥32 位）、`DTK_DATABASE_URL`、`DTK_REDIS_URL`、`no_proxy`；
     `pytest tests/unit tests/replay -m "not integration and not live"`。Windows 上 25 个既有失败与补丁无关。
-- **SAU**（MIT）：`deploy/sau/Dockerfile` 只构建后端；上传器用 patchright，登录/校验用 playwright + xhs，两者及浏览器都要装。SAU 无鉴权，只在内部网络可达。平台编号见 `constants.SAU_PLATFORM_TYPES`；定时发布依赖容器时区 `TZ=CST-8`。
+- **SAU**（MIT）：`deploy/sau/Dockerfile` 只构建后端；容器启动时 `entrypoint.sh` 依次执行 `patch-login.py`（扫码登录）和 `patch-publish.py`（抖音发布带上 `desc` 正文和竖版封面 `thumbnailPortrait`，2026-10-21），都按锚点幂等打补丁，锚点对不上就跳过并打印 skip。上传器用 patchright，登录/校验用 playwright + xhs，两者及浏览器都要装。SAU 无鉴权，只在内部网络可达。平台编号见 `constants.SAU_PLATFORM_TYPES`；定时发布依赖容器时区 `TZ=CST-8`。
 
 ## 部署要点
 

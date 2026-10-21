@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path, PurePath
 from typing import Any
 from urllib.parse import urlsplit
@@ -14,11 +15,22 @@ from hub.errors import ErrorCode, HubError
 from hub.models import MediaFile, PlatformAccount, Task
 from hub.providers.sau import PostVideoSpec, SauClient
 from hub.schemas import PublishVideoRequest
-from hub.services.media import ALLOWED_VIDEO_SUFFIXES, download_to, stored_name, tenant_dir
+from hub.services.media import (
+    ALLOWED_IMAGE_SUFFIXES,
+    ALLOWED_VIDEO_SUFFIXES,
+    MAX_COVER_BYTES,
+    download_to,
+    stored_name,
+    tenant_dir,
+)
 from hub.services.urls import ensure_public_url
 from hub.settings import Settings
 
 FALLBACK_SUFFIX = ".mp4"
+COVER_FALLBACK_SUFFIX = ".jpg"
+IMAGE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+
+log = logging.getLogger("hub.publishing")
 
 
 async def load_media(session: AsyncSession, media_id: str, tenant_id: str) -> MediaFile:
@@ -81,6 +93,37 @@ async def _source(
     return destination, True
 
 
+async def _cover(
+    request: PublishVideoRequest, tenant_id: str, *, http: httpx.AsyncClient, settings: Settings
+) -> Path | None:
+    """The cover image, downloaded; None when there is none or it cannot be fetched.
+
+    A cover is a nice-to-have: the post goes on without it, with the platform's own cover.
+    """
+    if not request.cover_url:
+        return None
+    try:
+        url = await ensure_public_url(
+            request.cover_url, field="cover_url", allow_private=settings.allow_private_urls
+        )
+        suffix = PurePath(urlsplit(url).path).suffix.lower()
+        destination = tenant_dir(settings.media_dir, tenant_id) / stored_name(
+            suffix if suffix in ALLOWED_IMAGE_SUFFIXES else COVER_FALLBACK_SUFFIX
+        )
+        await download_to(
+            http,
+            url,
+            destination,
+            max_bytes=MAX_COVER_BYTES,
+            request_timeout=settings.remote_fetch_timeout_seconds,
+            field="cover_url",
+        )
+    except HubError as exc:
+        log.warning("cover skipped: %s %s", exc.code, exc.details)
+        return None
+    return destination
+
+
 async def run_publish(
     task: Task,
     *,
@@ -96,9 +139,13 @@ async def run_publish(
     )
     await session.commit()
     source, temporary = await _source(request, media, task.tenant_id, http=http, settings=settings)
+    cover = await _cover(request, task.tenant_id, http=http, settings=settings)
     staged: str | None = None
+    staged_cover: str | None = None
     try:
         staged = await sau.stage_video(source)
+        if cover is not None:
+            staged_cover = await sau.stage_video(cover, IMAGE_TYPES.get(cover.suffix, "image/jpeg"))
         await sau.post_video(
             PostVideoSpec(
                 platform_type=SAU_PLATFORM_TYPES[request.platform],
@@ -109,16 +156,22 @@ async def run_publish(
                 daily_times=tuple(request.schedule.daily_times) if request.schedule else (),
                 start_days=request.schedule.start_days if request.schedule else 0,
                 draft=request.draft,
+                description=request.description,
+                cover_file=staged_cover or "",
             )
         )
     finally:
-        if staged is not None:
-            await sau.discard_video(staged)
+        for name in (staged, staged_cover):
+            if name is not None:
+                await sau.discard_video(name)
         if temporary:
             source.unlink(missing_ok=True)
+        if cover is not None:
+            cover.unlink(missing_ok=True)
     return {
         "platform": request.platform.value,
         "account_id": account.id,
         "scheduled": request.schedule is not None,
         "draft": request.draft,
+        "cover": staged_cover is not None,
     }
