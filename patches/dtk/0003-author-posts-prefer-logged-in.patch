@@ -1,0 +1,116 @@
+diff --git a/src/dtk/scheduler/scheduler.py b/src/dtk/scheduler/scheduler.py
+index 3ac92ff..425d758 100644
+--- a/src/dtk/scheduler/scheduler.py
++++ b/src/dtk/scheduler/scheduler.py
+@@ -34,6 +34,12 @@ log = get_logger(__name__)
+ #: refusal it is, so these are served by logged-in identities only.
+ LOGIN_ONLY_ENDPOINTS: frozenset[str] = frozenset({"douyin.search"})
+ 
++#: media-hub patch: endpoints a guest can read but sees late. An author's post list fetched
++#: as a guest lagged behind the profile (2026-11-06: the post made that day was missing,
++#: and two of the last week's), so these try logged-in identities first and fall back to a
++#: guest only when every logged-in one is busy or out of quota.
++LOGIN_PREFERRED_ENDPOINTS: frozenset[str] = frozenset({"douyin.author_posts"})
++
+ 
+ @dataclass(frozen=True, slots=True)
+ class Candidate:
+@@ -263,7 +269,8 @@ class Scheduler:
+             # logged-in one only when every guest is busy or out of quota, so the
+             # sessions merchants lend the pool are spent on what only they can do.
+             guests = [c for c in ranked if not c.authenticated]
+-            ranked = guests + [c for c in ranked if c.authenticated]
++            members = [c for c in ranked if c.authenticated]
++            ranked = members + guests if endpoint in LOGIN_PREFERRED_ENDPOINTS else guests + members
+         for candidate in ranked:
+             lease, why = await try_acquire(
+                 candidate.identity_id,
+diff --git a/tests/integration/test_scheduler_login_preferred.py b/tests/integration/test_scheduler_login_preferred.py
+new file mode 100644
+index 0000000..5522ae4
+--- /dev/null
++++ b/tests/integration/test_scheduler_login_preferred.py
+@@ -0,0 +1,83 @@
++"""media-hub patch: an author's post list goes to logged-in identities first.
++
++A guest can read an author's posts, but its list lags behind the profile: on
++2026-11-06 the post made that day was missing from it. Watching competitors
++depends on seeing the newest post, so this endpoint prefers a logged-in session
++and only falls back to a guest when none is free.
++"""
++
++from __future__ import annotations
++
++import pytest
++
++from dtk.core.types import IdentityState, Outcome, Platform
++from dtk.scheduler.health import HealthInput
++from dtk.scheduler.scheduler import Candidate, Scheduler, SchedulerConfig
++
++pytestmark = [pytest.mark.integration, pytest.mark.asyncio]
++
++NOW = 1_700_000_000.0
++AUTHOR_POSTS = "douyin.author_posts"
++DETAIL = "douyin.content_detail"
++
++
++class FrozenClock:
++    def __call__(self) -> float:
++        return NOW
++
++
++class ListSource:
++    def __init__(self, candidates):
++        self._candidates = candidates
++
++    async def candidates(self, platform, state):
++        return [c for c in self._candidates if c.platform == platform and c.state == state]
++
++
++def candidate(name, *, authenticated, state=IdentityState.ACTIVE, last_used=None):
++    return Candidate(
++        identity_id=name,
++        platform=Platform.DOUYIN,
++        state=state,
++        last_used_at=last_used,
++        health=HealthInput(20, 20, 60, 0, 0),
++        authenticated=authenticated,
++    )
++
++
++def scheduler(pool, *, wait=5.0):
++    return Scheduler(
++        ListSource(pool),
++        SchedulerConfig(max_wait_seconds=wait, poll_interval_seconds=0.01, inflight_ttl_seconds=60),
++        clock=FrozenClock(),
++    )
++
++
++async def test_author_posts_go_to_a_logged_in_identity_first(redis_client):
++    # The guest is the least recently used, so plain ranking would pick it.
++    pool = [
++        candidate("guest", authenticated=False, last_used=NOW - 1000),
++        candidate("merchant", authenticated=True, last_used=NOW - 1),
++    ]
++    sched = scheduler(pool)
++    first = await sched.acquire(AUTHOR_POSTS, Platform.DOUYIN)
++    assert first.identity_id == "merchant"
++    # While the logged-in identity is busy, a guest still serves the list.
++    second = await sched.acquire(AUTHOR_POSTS, Platform.DOUYIN)
++    assert second.identity_id == "guest"
++    await sched.release(first, Outcome.OK)
++    await sched.release(second, Outcome.OK)
++
++
++async def test_author_posts_still_work_without_a_logged_in_identity(redis_client):
++    lease = await scheduler([candidate("guest", authenticated=False)]).acquire(AUTHOR_POSTS, Platform.DOUYIN)
++    assert lease.identity_id == "guest"
++
++
++async def test_other_public_endpoints_keep_spending_guests_first(redis_client):
++    pool = [
++        candidate("merchant", authenticated=True, last_used=NOW - 1000),
++        candidate("guest", authenticated=False, last_used=NOW - 1),
++    ]
++    lease = await scheduler(pool).acquire(DETAIL, Platform.DOUYIN)
++    assert lease.identity_id == "guest"
